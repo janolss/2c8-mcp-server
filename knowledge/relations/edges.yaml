@@ -5,6 +5,20 @@ guidance:
   - Prefer orthogonal flow left-to-right for process readability
   - Center-center (diagonal) edges require repository configuration enabling them
   - Edge type must be allowed by repository configuration for the model type
+  - FLOW — main spine between business objects (states/results) and activities
+  - RACI_RESPONSIBLE (API: raciresponsible) — role/position → activity ownership; do not infer from placement alone
+  - CONTROLS — core_document → activity when the document steers how the activity is performed
+  - IS_USED_BY (API: isusedby) — application or template document → activity when it is used as support, not governance
+  - Never invent a role→checklist CONTROLS link; checklists govern activities, not roles
+commonEdgeTypes:
+  - api: flow
+    meaning: Process/input-output chain
+  - api: raciresponsible
+    meaning: RACI Responsible
+  - api: controls
+    meaning: Steering document controls activity
+  - api: isusedby
+    meaning: Application or template is used by activity
 api:
   create: POST /api/v1/repositories/{repositoryId}/models/{modelId}/canvas/edges
   delete: DELETE /api/v1/repositories/{repositoryId}/models/{modelId}/canvas/edges/{edgeId}

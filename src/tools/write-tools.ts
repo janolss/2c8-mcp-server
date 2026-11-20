@@ -17,6 +17,44 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
   const writer = ctx.writer;
 
   server.registerTool(
+    "create_repository",
+    {
+      description:
+        "Create a new 2c8 repository (POST /repositories). Use for sandboxes such as 'Utveckling MCP'.",
+      inputSchema: {
+        name: z.string().min(1),
+        languages: z
+          .array(
+            z.object({
+              name: z.string(),
+              locale: z.string(),
+              default: z.boolean().optional(),
+            }),
+          )
+          .optional()
+          .describe("Defaults to Svenska sv_SE"),
+        template: z.boolean().optional(),
+        owner: uuid.optional(),
+        directory: uuid.optional(),
+        colorScheme: uuid.optional(),
+        body: jsonBody.optional(),
+      },
+    },
+    async (args) =>
+      runTool(() =>
+        writer.createRepository({
+          name: args.name,
+          languages: args.languages,
+          template: args.template,
+          owner: args.owner,
+          directory: args.directory,
+          colorScheme: args.colorScheme,
+          body: args.body,
+        }),
+      ),
+  );
+
+  server.registerTool(
     "create_process_model",
     {
       description:
@@ -42,6 +80,26 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
           body: args.body,
         }),
       ),
+  );
+
+  server.registerTool(
+    "create_canvas_edge",
+    {
+      description:
+        "Create a canvas edge between two vertices (orthogonal points + labels). edgeType: FLOW, RACI_RESPONSIBLE, CONTROLS, IS_USED_BY (aliases accepted).",
+      inputSchema: {
+        repositoryId,
+        modelId: uuid,
+        fromVertexId: uuid,
+        toVertexId: uuid,
+        languageId,
+        edgeType: z
+          .string()
+          .min(1)
+          .describe("e.g. flow, raciresponsible, controls, isusedby"),
+      },
+    },
+    async (args) => runTool(() => writer.createCanvasEdge(args)),
   );
 
   server.registerTool(
@@ -107,11 +165,17 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "reuse_symbol",
     {
       description:
-        "Place an existing symbol UUID on a model canvas (reuse, not duplicate).",
+        "Place an existing symbol UUID on a model canvas (reuse, not duplicate). Uses repository symbolsizes + label placement (inside for activity/process, below for small icons).",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         symbolId: uuid,
+        languageId,
+        title: z.string().optional().describe("For label bounds sizing"),
+        objectType: z
+          .string()
+          .optional()
+          .describe("Defaults to activity; drives symbolsizes lookup"),
         x: z.number().optional(),
         y: z.number().optional(),
       },
@@ -123,13 +187,18 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "set_activity_performer",
     {
       description:
-        "Link a role/position/organisation symbol as performer of an activity vertex.",
+        "Link a role/position/organisation symbol as performer of an activity vertex (default edgeType RACI_RESPONSIBLE).",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         activityVertexId: uuid,
         performerSymbolId: uuid,
-        edgeType: z.string().optional(),
+        languageId,
+        performerTitle: z.string().optional(),
+        edgeType: z
+          .string()
+          .optional()
+          .describe("Defaults to raciresponsible"),
         x: z.number().optional(),
         y: z.number().optional(),
       },
@@ -141,12 +210,13 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "set_step_io",
     {
       description:
-        "Connect two vertices with a flow edge to express input/output between steps.",
+        "Connect two vertices with a FLOW edge to express input/output between steps.",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         fromVertexId: uuid,
         toVertexId: uuid,
+        languageId,
         edgeType: z.string().optional(),
       },
     },

@@ -6,18 +6,20 @@ export const SERVER_INSTRUCTIONS = `You are working with 2c8 Modeling Tool via t
 
 ## Mandatory agent policies
 1. Reuse-first: ALWAYS call search_symbols before creating symbols. Reuse existing UUID when the business concept matches. Never create silent duplicates.
-2. Draft-first when writes are enabled: prefer create_process_model (draft mode) then accept_draft_model.
-3. Process models should have explicit input(s) and output/result.
-4. Activities should have a performer (role, position or organisation).
+2. Draft-first when writes are enabled: prefer create_process_model (draft mode) then accept_draft_model. Sandbox repos may use direct write mode.
+3. Process models should have explicit input(s) and output/result as business objects on the FLOW spine (not only activities).
+4. Activities should have a performer via RACI_RESPONSIBLE (raciresponsible). Placement alone is not ownership.
 5. Naming: process/activity titles use infinitive verb + noun (e.g. "Registrera order").
 6. Call get_methodology / validate_against_methodology / list_allowed_types before large writes.
-7. Prefer domain tools (describe_process, describe_role, describe_role_introduction, find_symbol_usage, …) over inventing raw canvas payloads.
+7. Prefer domain tools (describe_process, describe_role, describe_role_introduction, find_symbol_usage, propose_model_from_text, …) over inventing raw canvas payloads.
+8. Steering docs use CONTROLS; apps/templates use IS_USED_BY. Do not invent role→checklist CONTROLS.
 
 ## Suggested workflows
 - Consume process: find_models → describe_process (primary).
 - Role / onboarding: describe_role_introduction (primary) → get_document_content on formalIntroduction docs. Fallback: describe_role → get_controlling_documents → search_documents.
-- Text-to-model: propose_model_from_text → validate_against_methodology → search_symbols → apply_model_proposal
+- Text-to-model: propose_model_from_text → search_symbols (reuse) → apply_model_proposal → describe_process to verify
 - Document-to-model: propose_model_from_document → same validation/apply path
+- New sandbox repo: create_repository → list_languages → text-to-model workflow
 
 ## Consume tips
 - get_process_flow includes titles and grouped inputs/outputs/responsible/applications/controlledBy — do not N+1 fetch symbols for titles.

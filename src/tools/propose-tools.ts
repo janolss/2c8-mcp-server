@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 import {
+  normalizeProposal,
   proposeModelFromDocument,
   proposeModelFromText,
   type ModelProposal,
@@ -18,14 +19,34 @@ const proposedStepSchema = z.object({
   title: z.string(),
   objectType: z.string(),
   performerTitle: z.string().optional(),
+  performers: z.array(z.string()).optional(),
   inputs: z.array(z.string()).optional(),
   outputs: z.array(z.string()).optional(),
   documents: z.array(z.string()).optional(),
+  controlledBy: z.array(z.string()).optional(),
+  usedBy: z.array(z.string()).optional(),
+});
+
+const chainNodeSchema = z.object({
+  kind: z.enum(["businessObject", "activity"]),
+  title: z.string(),
+  objectType: z.string(),
+});
+
+const activityDetailSchema = z.object({
+  title: z.string(),
+  performers: z.array(z.string()).default([]),
+  controlledBy: z.array(z.string()).default([]),
+  usedBy: z.array(z.string()).default([]),
+  usedByTypes: z.record(z.string(), z.string()).optional(),
 });
 
 const proposalSchema = z.object({
   modelType: z.string(),
   title: z.string(),
+  processTitle: z.string().optional(),
+  chain: z.array(chainNodeSchema).optional(),
+  activities: z.array(activityDetailSchema).optional(),
   steps: z.array(proposedStepSchema),
   methodologyNotes: z.array(z.string()).optional(),
   namingChecks: z
@@ -49,7 +70,7 @@ export function registerProposeTools(
     "propose_model_from_text",
     {
       description:
-        "Text-to-model: parse free text into a structured process proposal (no writes). Review, search_symbols, validate, then apply_model_proposal.",
+        "Text-to-model: parse free text (Swedish narrative or prefixed lines) into a structured process proposal with FLOW chain, RACI, CONTROLS and IS_USED_BY (no writes). Review, search_symbols, then apply_model_proposal.",
       inputSchema: {
         text: z.string().min(1),
         modelType: z.string().optional().describe("Defaults to process"),
@@ -81,7 +102,7 @@ export function registerProposeTools(
       "apply_model_proposal",
       {
         description:
-          "Apply a previously proposed process model (batch write with reuse-first step creation). Prefer draft write mode.",
+          "Apply a process proposal: create model, FLOW chain (BO↔activity), RACI_RESPONSIBLE, CONTROLS, IS_USED_BY, process chevron. Reuse-first for symbols.",
         inputSchema: {
           repositoryId,
           languageId,
@@ -96,18 +117,11 @@ export function registerProposeTools(
       },
       async (args) =>
         runTool(() => {
-          const proposal = args.proposal as ModelProposal;
+          const proposal = normalizeProposal(args.proposal as ModelProposal);
           return ctx.writer!.applyProposal({
             repositoryId: args.repositoryId,
             languageId: args.languageId,
-            proposal: {
-              modelType: proposal.modelType,
-              title: proposal.title,
-              steps: proposal.steps,
-              methodologyNotes: proposal.methodologyNotes ?? [],
-              namingChecks: proposal.namingChecks ?? [],
-              nextSuggestedTools: proposal.nextSuggestedTools ?? [],
-            },
+            proposal,
             modelId: args.modelId,
             permissionGroup: args.permissionGroup,
             owner: args.owner,

@@ -92,6 +92,152 @@ export async function loadRepoConfiguration(
   }
 }
 
+export interface SymbolSizeSpec {
+  width: number;
+  height: number;
+  canChange?: boolean;
+}
+
+export interface QuickdrawDistance {
+  top: number;
+  left: number;
+  bottom: number;
+  right: number;
+}
+
+/** Fallback sizes when repository configuration omits a type (common for activity/application). */
+const FALLBACK_SYMBOL_SIZES: Record<string, SymbolSizeSpec> = {
+  activity: { width: 75, height: 50 },
+  process: { width: 90, height: 50 },
+  businessobject: { width: 18, height: 18 },
+  role: { width: 30, height: 18 },
+  position: { width: 30, height: 18 },
+  organization: { width: 30, height: 18 },
+  organisation: { width: 30, height: 18 },
+  application: { width: 20, height: 25 },
+  coredocument: { width: 18, height: 18 },
+  document: { width: 18, height: 18 },
+};
+
+function objectTypeKey(objectType: string): string {
+  return objectType.trim().toLowerCase().replace(/[_\s-]/g, "");
+}
+
+/**
+ * Parse symbolsizes.symbol[] from repository configuration.
+ */
+export function extractSymbolSizes(
+  config: unknown,
+): Map<string, SymbolSizeSpec> {
+  const map = new Map<string, SymbolSizeSpec>();
+  const root = config as {
+    symbolsizes?: { symbol?: Array<Record<string, unknown>> };
+  } | null;
+  const list = root?.symbolsizes?.symbol;
+  if (!Array.isArray(list)) {
+    return map;
+  }
+  for (const item of list) {
+    const type = String(item.type ?? "");
+    const width = Number(item.width);
+    const height = Number(item.height);
+    if (!type || !Number.isFinite(width) || !Number.isFinite(height)) {
+      continue;
+    }
+    map.set(objectTypeKey(type), {
+      width,
+      height,
+      canChange: item.canchange === true || item.canchange === "true",
+    });
+  }
+  return map;
+}
+
+/**
+ * Quickdraw placement margins (not a general process-flow gap).
+ * Present as quickdraw["distance-to-new-symbol"] = { top, left, bottom, right }.
+ */
+export function extractQuickdrawDistance(
+  config: unknown,
+): QuickdrawDistance | null {
+  const root = config as {
+    quickdraw?: Record<string, unknown>;
+  } | null;
+  const dist = root?.quickdraw?.["distance-to-new-symbol"] as
+    | Record<string, unknown>
+    | undefined;
+  if (!dist) {
+    return null;
+  }
+  const top = Number(dist.top);
+  const left = Number(dist.left);
+  const bottom = Number(dist.bottom);
+  const right = Number(dist.right);
+  if (![top, left, bottom, right].every(Number.isFinite)) {
+    return null;
+  }
+  return { top, left, bottom, right };
+}
+
+export function resolveSymbolSize(
+  objectType: string,
+  config: unknown | null,
+): SymbolSizeSpec {
+  const key = objectTypeKey(objectType);
+  if (config) {
+    const fromConfig = extractSymbolSizes(config).get(key);
+    if (fromConfig) {
+      return fromConfig;
+    }
+  }
+  return (
+    FALLBACK_SYMBOL_SIZES[key] ?? {
+      width: 75,
+      height: 50,
+    }
+  );
+}
+
+export type OutsideLabelSide = "above" | "below" | "left" | "right";
+export type LabelPlacement = "inside" | OutsideLabelSide;
+
+/**
+ * Large symbols (activity/process) keep labels inside; small icons use an outside label.
+ */
+export function labelPlacementForObjectType(
+  objectType: string,
+  size: SymbolSizeSpec,
+): LabelPlacement {
+  const key = objectTypeKey(objectType);
+  if (key === "activity" || key === "process") {
+    return "inside";
+  }
+  // OpenAPI: vertices smaller than 65×20 with centerLabel use above/below
+  if (size.width < 65 || size.height < 40) {
+    return "below";
+  }
+  return "inside";
+}
+
+/**
+ * Place outside label on the opposite side of the edge attachment so text
+ * does not sit on the relation (e.g. CONTROLS doc above activity → label above).
+ */
+export function outsideLabelAwayFromEdge(
+  edgeAttachSide: "top" | "bottom" | "left" | "right",
+): OutsideLabelSide {
+  switch (edgeAttachSide) {
+    case "top":
+      return "below";
+    case "bottom":
+      return "above";
+    case "left":
+      return "right";
+    case "right":
+      return "left";
+  }
+}
+
 /**
  * Best-effort extraction of allowed type strings from opaque configuration JSON.
  */
