@@ -1,17 +1,22 @@
 # 2c8 MCP Server
 
-MCP server that exposes curated tools for working with models and objects in the
-[2c8 Modeling Tool](https://www.2c8.com) MT backend API from an AI agent.
+Metodikdriven MCP-server för AI-agenter som ska **konsumera** och **skapa/redigera**
+verksamhetens processer i [2c8 Modeling Tool](https://www.2c8.com)
+(flöden, roller/ansvar, dokumentlänkar, nedbrytningar) enligt text-to-model,
+talk-to-model och document-to-model.
 
-OpenAPI reference: https://developer.2c8.com/reference/openapi.json
+OpenAPI: `https://<host>/mt-backend/api/v1/openapi.json`  
+Metodik: kuraterat pack under [`knowledge/`](knowledge/) (baserat på
+[2c8 Help Center](https://support.2c8.com/hc/sv/categories/4906383560093-2c8-Modeling-Tool)).
 
 ## Features
 
-- TypeScript MCP server using `@modelcontextprotocol/sdk`
-- Dual transport: **stdio** (default) and **Streamable HTTP**
-- Auth via `TWO_C8_BASE_URL` + `TWO_C8_API_KEY` (`x-api-key`)
-- **Read-only by default** — write tools are only registered when `TWO_C8_ALLOW_WRITES=true`
-- Curated tool surface for repositories, models, symbols, canvas, descriptions, relations, queries, and directories
+- TypeScript MCP med `@modelcontextprotocol/sdk`
+- **Streamable HTTP** (primärt) och stdio
+- Domain-verktyg (process flow, reuse-first, propose/apply) + analys (list/query/matrix/relation)
+- MCP **resources** (`methodology://…`), **prompts** och server **instructions**
+- Regler från knowledge-pack + repository `configuration`
+- Write bakom `TWO_C8_ALLOW_WRITES` med `TWO_C8_WRITE_MODE=draft|direct`
 
 ## Requirements
 
@@ -22,7 +27,7 @@ OpenAPI reference: https://developer.2c8.com/reference/openapi.json
 ```bash
 npm install
 cp .env.example .env
-# edit .env with your MT backend URL and API key
+# edit .env
 npm run build
 ```
 
@@ -30,61 +35,68 @@ npm run build
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TWO_C8_BASE_URL` | *(required)* | MT backend base URL, e.g. `https://host.example/mt-backend` |
-| `TWO_C8_API_KEY` | *(required)* | API key sent as `x-api-key` |
-| `TWO_C8_ALLOW_WRITES` | `false` | When `true`, register create/update/delete tools |
+| `TWO_C8_BASE_URL` | *(required)* | MT backend base URL |
+| `TWO_C8_API_KEY` | *(required)* | API key (`x-api-key`) |
+| `TWO_C8_ALLOW_WRITES` | `false` | Register write tools |
+| `TWO_C8_WRITE_MODE` | `draft` | `draft` or `direct` |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
-| `PORT` | `3000` | HTTP listen port |
-| `HOST` | `127.0.0.1` | HTTP listen host |
-
-You can also pass `--http` to force Streamable HTTP mode.
+| `PORT` | `3000` | HTTP port |
+| `HOST` | `127.0.0.1` | HTTP host |
+| `KNOWLEDGE_DIR` | *(auto)* | Override path to `knowledge/` |
 
 ## Run
 
 ```bash
-# stdio (for Cursor / Claude Desktop)
-npm start
-
-# Streamable HTTP on /mcp
+# HTTP (AI tools point at http://host:port/mcp)
 npm run start:http
+
+# stdio (Cursor / Claude Desktop)
+npm start
 ```
 
-Health check (HTTP mode): `GET /health`
+Health: `GET /health`
 
-## Cursor MCP config (stdio)
+### Docker
 
-```json
-{
-  "mcpServers": {
-    "2c8": {
-      "command": "node",
-      "args": ["/absolute/path/to/2c8-mcp-server/dist/index.js"],
-      "env": {
-        "TWO_C8_BASE_URL": "https://your-server.example/mt-backend",
-        "TWO_C8_API_KEY": "your-api-key",
-        "TWO_C8_ALLOW_WRITES": "false"
-      }
-    }
-  }
-}
+```bash
+docker build -t 2c8-mcp-server .
+docker run --rm -p 3000:3000 \
+  -e TWO_C8_BASE_URL=https://host/mt-backend \
+  -e TWO_C8_API_KEY=... \
+  -e TWO_C8_ALLOW_WRITES=false \
+  2c8-mcp-server
 ```
 
-## Tools (read-only)
+## Agent workflows
 
-Repositories, models, versions, symbols, canvas/vertices, descriptions, languages,
-description types, relations, queries/lists (execute), directories, API versions.
+| Prompt | Purpose |
+|--------|---------|
+| `consume_process` | Förstå befintlig process |
+| `text_to_process_model` | Text/talk → modell |
+| `document_to_process_model` | Dokument → modell |
 
-## Tools (writes, when enabled)
+Policy (server instructions): reuse-first, draft-first, input/output på process,
+utförare på aktivitet, namngivning verb+substantiv.
 
-Create/update/delete models and symbols, draft create/accept, canvas update,
-create/delete vertices and edges, update model/symbol descriptions.
+## Tool surface (fas 1)
 
-Write request bodies are passed as JSON objects matching the 2c8 OpenAPI DTOs.
+**Orientering:** `get_methodology`, `list_allowed_types`, `validate_against_methodology`  
+**Konsumera:** `describe_process`, `describe_role`, `describe_role_introduction`
+(operativ RACI vs formell HR-intro vs stödhintar), `find_symbol_usage` (`enrich`),
+`get_controlling_documents`, `find_models`, `get_process_flow` (inkl. CONTROLS),
+`resolve_symbols`, `search_documents`, `resolve_documents`, `get_document_content`,
+`search_symbols` (`modelId`), övriga läsverktyg  
+**Analys:** `execute_query`, `execute_list`, `execute_matrix`, `execute_relation`, …  
+**Propose:** `propose_model_from_text`, `propose_model_from_document`  
+**Write (om aktiverat):** `create_process_model`, `add_process_step`, `reuse_symbol`,
+`set_activity_performer`, `set_step_io`, `link_document`, `create_breakdown`,
+`place_in_swimlane`, `apply_model_proposal`, …
+
+Se [API-GAP-ANALYSIS.md](API-GAP-ANALYSIS.md) för API-täckning.
 
 ## Development
 
 ```bash
-npm run dev
 npm run dev:http
 npm run typecheck
 ```

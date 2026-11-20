@@ -21,7 +21,6 @@ export const pagination = {
   projection,
 };
 
-/** Optional permission-group header. All Users: 8ea77d81-d79c-40f8-8cfc-279fe9e7b2eb */
 export const permissionGroupHeader = z
   .string()
   .uuid()
@@ -33,3 +32,5 @@ export const permissionGroupHeader = z
 export const jsonBody = z
   .record(z.string(), z.unknown())
   .describe("JSON request body matching the 2c8 OpenAPI DTO for this operation");
+
+export const languageId = uuid.describe("Language UUID for titles");

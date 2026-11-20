@@ -1,37 +1,18 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { TwoC8Client } from "../client/twoc8-client.js";
-import { registerCanvasReadTools, registerCanvasWriteTools } from "./canvas.js";
-import {
-  registerDescriptionReadTools,
-  registerDescriptionWriteTools,
-} from "./descriptions.js";
-import { registerDirectoryTools } from "./directories.js";
-import { registerMetaTools } from "./meta.js";
-import { registerModelReadTools, registerModelWriteTools } from "./models.js";
-import { registerQueryTools } from "./queries.js";
-import { registerRelationTools } from "./relations.js";
-import { registerRepositoryTools } from "./repositories.js";
-import { registerSymbolReadTools, registerSymbolWriteTools } from "./symbols.js";
+import type { ToolContext } from "./context.js";
+import { registerAnalysisTools } from "./analysis-tools.js";
+import { registerConsumeTools } from "./consume-tools.js";
+import { registerMethodologyTools } from "./methodology-tools.js";
+import { registerProposeTools } from "./propose-tools.js";
+import { registerWriteTools } from "./write-tools.js";
 
-export function registerAllTools(
-  server: McpServer,
-  client: TwoC8Client,
-  allowWrites: boolean,
-): void {
-  registerMetaTools(server, client);
-  registerRepositoryTools(server, client);
-  registerModelReadTools(server, client);
-  registerSymbolReadTools(server, client);
-  registerCanvasReadTools(server, client);
-  registerDescriptionReadTools(server, client);
-  registerRelationTools(server, client);
-  registerQueryTools(server, client);
-  registerDirectoryTools(server, client);
+export function registerAllTools(server: McpServer, ctx: ToolContext): void {
+  registerMethodologyTools(server, ctx);
+  registerConsumeTools(server, ctx);
+  registerAnalysisTools(server, ctx);
+  registerProposeTools(server, ctx);
 
-  if (allowWrites) {
-    registerModelWriteTools(server, client);
-    registerSymbolWriteTools(server, client);
-    registerCanvasWriteTools(server, client);
-    registerDescriptionWriteTools(server, client);
+  if (ctx.config.allowWrites) {
+    registerWriteTools(server, ctx);
   }
 }

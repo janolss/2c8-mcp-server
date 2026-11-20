@@ -1,5 +1,15 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+export interface AgentPayload {
+  data?: unknown;
+  methodologyNotes?: string[];
+  namingCheck?: { pass: boolean; hint?: string; objectTypeId?: string };
+  reuseCandidates?: unknown[];
+  configViolations?: string[];
+  nextSuggestedTools?: string[];
+  [key: string]: unknown;
+}
+
 export function jsonResult(data: unknown): CallToolResult {
   return {
     content: [
@@ -27,4 +37,8 @@ export async function runTool(
   } catch (error) {
     return errorResult(error);
   }
+}
+
+export function agentResult(payload: AgentPayload): CallToolResult {
+  return jsonResult(payload);
 }

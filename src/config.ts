@@ -1,12 +1,15 @@
 export type TransportMode = "stdio" | "http";
+export type WriteMode = "draft" | "direct";
 
 export interface AppConfig {
   baseUrl: string;
   apiKey: string;
   allowWrites: boolean;
+  writeMode: WriteMode;
   transport: TransportMode;
   port: number;
   host: string;
+  knowledgeDir?: string;
 }
 
 function parseBool(value: string | undefined, defaultValue: boolean): boolean {
@@ -39,8 +42,12 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AppConfig {
   const baseUrl = requireEnv("TWO_C8_BASE_URL").replace(/\/+$/, "");
   const apiKey = requireEnv("TWO_C8_API_KEY");
   const allowWrites = parseBool(process.env.TWO_C8_ALLOW_WRITES, false);
+  const writeModeRaw = process.env.TWO_C8_WRITE_MODE?.trim().toLowerCase();
+  const writeMode: WriteMode =
+    writeModeRaw === "direct" ? "direct" : "draft";
   const port = Number.parseInt(process.env.PORT ?? "3000", 10);
   const host = process.env.HOST?.trim() || "127.0.0.1";
+  const knowledgeDir = process.env.KNOWLEDGE_DIR?.trim() || undefined;
 
   if (!Number.isFinite(port) || port <= 0) {
     throw new Error(`Invalid PORT: ${process.env.PORT}`);
@@ -50,8 +57,10 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): AppConfig {
     baseUrl,
     apiKey,
     allowWrites,
+    writeMode,
     transport: wantsHttp ? "http" : "stdio",
     port,
     host,
+    knowledgeDir,
   };
 }

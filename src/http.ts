@@ -54,6 +54,7 @@ export async function startHttpServer(config: AppConfig): Promise<void> {
     res.json({
       ok: true,
       allowWrites: config.allowWrites,
+      writeMode: config.writeMode,
       transport: "http",
     });
   });
@@ -65,7 +66,7 @@ export async function startHttpServer(config: AppConfig): Promise<void> {
         return;
       }
       console.error(
-        `2c8 MCP server (HTTP) listening on http://${config.host}:${config.port}/mcp (writes=${config.allowWrites})`,
+        `2c8 MCP server (HTTP) listening on http://${config.host}:${config.port}/mcp (writes=${config.allowWrites}, writeMode=${config.writeMode})`,
       );
       resolve();
     });
