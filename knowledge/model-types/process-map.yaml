@@ -20,15 +20,24 @@ principles:
   - Reuse the same process symbol UUID on the map and as the breakdown target
   - Side loops (supporting processes) attach under a state BO, not as main-chain steps
   - >
-    Overview BO between process A and B = same symbol as A's detail OUTPUT and
-    B's detail INPUT (handoff continuity). Never invent an overview-only BO.
+    SCOPE: each overview process has the same input(s) and output(s) as its
+    detail model (same symbol UUIDs). The overview composes detail scopes —
+    it does not redefine them.
+  - >
+    Handoff BO between A and B = A's detail OUTPUT ∩ B's detail INPUT.
+    Never invent an overview-only BO to paper over mismatched details.
   - Never stack vertices on identical coordinates
+  - >
+    Multiple inputs/outputs: one primary BO on the FLOW midline; extras stacked
+    below (same X) with FLOW to process left (in) or from process right (out)
 modelingGuidance:
   - Use objectType process (chevron) on the overview canvas; never place activity steps here
-  - Name business objects as value/artefacts between processes (same value-stream rules)
   - >
-    Before create_process_map with detailModelId: call validate_process_map_bridges.
-    If detail A ends with BO X, detail B must include X as input before X is on the map.
+    Preferred build: get_detail_process_scope for each detail →
+    create_process_map(detailModelIds=[…]) so BO chain is server-derived
+  - >
+    Verify with describe_process_map(detailModelIds) — fix scopeViolations in
+    the DETAIL models, not by inventing map-only objects
   - >
     Link each process chevron to its detail model via breakdown
     (body symbol = processSymbolUuid)

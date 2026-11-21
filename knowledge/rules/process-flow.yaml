@@ -23,12 +23,25 @@ rules:
     description: >
       Never place two canvas vertices on the same (or overlapping) coordinates.
       Advance along the FLOW spine or nudge; tools auto-nudge when possible.
+  - id: multi-io-stack-below
+    severity: error
+    description: >
+      Multiple FLOW inputs/outputs for one process/activity: one primary BO on
+      the spine midline; 2nd/3rd/… stacked directly below (same X) with FLOW to
+      the left edge (inputs) or from the right edge (outputs). Never a horizontal
+      sequence of I/O BOs on the spine.
+  - id: overview-process-scope
+    severity: error
+    description: >
+      On a process map, each process chevron must have the same FLOW input(s)
+      and output(s) as its breakdown detail model (same symbol UUIDs). Use
+      get_detail_process_scope; prefer create_process_map(detailModelIds).
   - id: overview-bo-detail-handoff
     severity: error
     description: >
       On a process map, a business object between two processes must be the
       OUTPUT of the previous detail model and the INPUT of the next detail
-      model (same symbol UUID preferred). No overview-only bridge objects.
+      model (same symbol UUID). No overview-only bridge objects.
   - id: chain-io
     severity: info
     description: Prefer linking activity output as input to the next activity.

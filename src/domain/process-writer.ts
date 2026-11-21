@@ -691,12 +691,22 @@ export class ProcessWriter {
     repositoryId: string;
     languageId: string;
     title: string;
-    chain: Array<{
+    /**
+     * Preferred: ordered detail model UUIDs. Server builds the overview chain
+     * (BO↔process) from each detail's inputs/outputs — agents must not invent BOs.
+     */
+    detailModelIds?: string[];
+    chain?: Array<{
       kind: "businessObject" | "process";
       title: string;
       symbolId?: string;
       detailModelId?: string;
     }>;
+    /**
+     * When chain has detailModelId on processes, rewrite BO nodes from detail scopes
+     * (default true). Prevents overview-only invented inputs/outputs.
+     */
+    lockBosToDetailScope?: boolean;
     sideLoops?: Array<{
       fromBoTitle: string;
       processTitle: string;
@@ -709,18 +719,75 @@ export class ProcessWriter {
     group?: string;
     modelId?: string;
   }) {
-    const hasDetailLinks = args.chain.some(
+    let chain = args.chain ?? [];
+    let lockNotes: string[] = [];
+
+    if (args.detailModelIds?.length) {
+      const built = await this.reader.buildProcessMapChainFromDetails({
+        repositoryId: args.repositoryId,
+        modelIds: args.detailModelIds,
+        preserveOrder: true,
+      });
+      if (!built.readyForCreate) {
+        throw new Error(
+          `create_process_map blocked — cannot derive overview from detail scopes:\n` +
+            built.uncertainLinks.join("\n"),
+        );
+      }
+      chain = built.chain.map((n) => ({
+        kind: n.kind,
+        title: n.title,
+        symbolId: n.symbolId,
+        detailModelId: n.detailModelId,
+      }));
+      lockNotes.push(
+        "Chain derived from detailModelIds (BO titles/symbolIds locked to detail scopes).",
+      );
+    } else if (
+      chain.some((n) => n.kind === "process" && n.detailModelId) &&
+      args.lockBosToDetailScope !== false
+    ) {
+      const locked = await this.reader.lockProcessMapChainToDetailScopes({
+        repositoryId: args.repositoryId,
+        chain,
+      });
+      if (!locked.readyForCreate) {
+        throw new Error(
+          `create_process_map blocked — detail scopes do not form a valid handoff chain:\n` +
+            locked.uncertainLinks.join("\n"),
+        );
+      }
+      if (locked.rewrote) {
+        chain = locked.chain.map((n) => ({
+          kind: n.kind,
+          title: n.title,
+          symbolId: n.symbolId,
+          detailModelId: n.detailModelId,
+        }));
+        lockNotes.push(
+          "Business objects on the chain were replaced with detail-scope inputs/outputs (lockBosToDetailScope).",
+        );
+      }
+    }
+
+    if (chain.length === 0) {
+      throw new Error(
+        "create_process_map requires detailModelIds or a non-empty chain.",
+      );
+    }
+
+    const hasDetailLinks = chain.some(
       (n) => n.kind === "process" && n.detailModelId,
     );
     const bridgeValidation = hasDetailLinks
       ? await this.reader.validateProcessMapBoBridges({
           repositoryId: args.repositoryId,
-          chain: args.chain,
+          chain,
         })
       : { ok: true, checks: [], errors: [] as string[] };
     if (!bridgeValidation.ok) {
       throw new Error(
-        `create_process_map blocked — overview business objects must match detail I/O:\n` +
+        `create_process_map blocked — overview process scope must match detail I/O:\n` +
           bridgeValidation.errors.join("\n"),
       );
     }
@@ -802,17 +869,137 @@ export class ProcessWriter {
     }> = [];
     const breakdowns: unknown[] = [];
 
-    let prev: {
+    type SpineNode = {
       vertexId: string;
       x: number;
       y: number;
       width: number;
       height: number;
-    } | null = null;
+      kind: string;
+      title: string;
+      symbolId?: string;
+      detailModelId?: string;
+    };
 
-    for (const node of args.chain) {
-      const objectType =
-        node.kind === "process" ? "process" : "businessObject";
+    let prevSpine: SpineNode | null = null;
+    /** primary BO vertexId → stacked extra BO vertexIds */
+    const stackedUnder = new Map<string, string[]>();
+    const spineGroups = this.groupSpineNodes(chain);
+
+    const placeOneBo = async (
+      node: (typeof chain)[number],
+      x: number,
+      y: number,
+      onSpine: boolean,
+    ): Promise<SpineNode> => {
+      const size = this.sizeFor(repoConfig, "businessObject");
+      const symbolId =
+        node.symbolId ??
+        (await this.resolveOrCreateSymbol({
+          repositoryId: args.repositoryId,
+          languageId: args.languageId,
+          title: node.title,
+          objectType: "businessObject",
+          owner: args.owner,
+          group: args.group,
+          cache: symbolCache,
+        }));
+      const vertex = await this.placeVertex({
+        repositoryId: args.repositoryId,
+        modelId,
+        symbolId,
+        languageId: args.languageId,
+        title: node.title,
+        objectType: "businessObject",
+        x,
+        y,
+        width: size.width,
+        height: size.height,
+        reserved,
+        spineAlign: onSpine,
+      });
+      const usedX = vertex.x ?? x;
+      const usedY = vertex.y ?? y;
+      const entry: SpineNode = {
+        title: node.title,
+        kind: "businessObject",
+        symbolId,
+        vertexId: String(vertex.uuid),
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+      };
+      placed.push({
+        title: entry.title,
+        kind: entry.kind,
+        objectType: "businessObject",
+        symbolId,
+        vertexId: entry.vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+        detailModelId: node.detailModelId,
+      });
+      return entry;
+    };
+
+    for (let gi = 0; gi < spineGroups.length; gi++) {
+      const group = spineGroups[gi]!;
+      const prevIsProcess = prevSpine?.kind === "process";
+
+      if (group.type === "bo-group") {
+        const primaryNode = group.items[0]!;
+        const boSize = this.sizeFor(repoConfig, "businessObject");
+        const placeX = prevSpine
+          ? Math.round(prevSpine.x + prevSpine.width + gapX)
+          : 50;
+        const placeY = Math.round(spineMidY - boSize.height / 2);
+        const primary = await placeOneBo(primaryNode, placeX, placeY, true);
+
+        if (prevIsProcess && prevSpine) {
+          await this.createCanvasEdge({
+            repositoryId: args.repositoryId,
+            modelId,
+            fromVertexId: prevSpine.vertexId,
+            toVertexId: primary.vertexId,
+            edgeType: "flow",
+            languageId: args.languageId,
+          });
+        }
+
+        const stackedIds: string[] = [];
+        for (let si = 1; si < group.items.length; si++) {
+          const extra = group.items[si]!;
+          const sx = primary.x;
+          const sy = Math.round(
+            primary.y +
+              primary.height +
+              gapY +
+              (si - 1) * (boSize.height + gapY),
+          );
+          const stackedBo = await placeOneBo(extra, sx, sy, false);
+          stackedIds.push(stackedBo.vertexId);
+          if (prevIsProcess && prevSpine) {
+            // Extra outputs: leave process RIGHT → stacked BO
+            await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId,
+              fromVertexId: prevSpine.vertexId,
+              toVertexId: stackedBo.vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+            });
+          }
+        }
+        stackedUnder.set(primary.vertexId, stackedIds);
+        prevSpine = primary;
+        continue;
+      }
+
+      const node = group.item;
+      const objectType = node.kind === "process" ? "process" : "businessObject";
       const size = this.sizeFor(repoConfig, objectType);
       const symbolId =
         node.symbolId ??
@@ -825,12 +1012,10 @@ export class ProcessWriter {
           group: args.group,
           cache: symbolCache,
         }));
-
-      const placeX: number = prev
-        ? Math.round(prev.x + prev.width + gapX)
+      const placeX: number = prevSpine
+        ? Math.round(prevSpine.x + prevSpine.width + gapX)
         : 50;
       const placeY: number = Math.round(spineMidY - size.height / 2);
-
       const vertex = await this.placeVertex({
         repositoryId: args.repositoryId,
         modelId,
@@ -846,17 +1031,36 @@ export class ProcessWriter {
         spineAlign: true,
       });
       const vertexId = String(vertex.uuid);
-      const usedX = vertex.x ?? placeX;
-      const usedY = vertex.y ?? placeY;
-      if (prev) {
-        await this.createCanvasEdge({
-          repositoryId: args.repositoryId,
-          modelId,
-          fromVertexId: prev.vertexId,
-          toVertexId: vertexId,
-          edgeType: "flow",
-          languageId: args.languageId,
-        });
+      const usedX: number = vertex.x ?? placeX;
+      const usedY: number = vertex.y ?? placeY;
+
+      if (prevSpine) {
+        if (prevSpine.kind === "businessObject") {
+          // Primary + stacked extras → process LEFT (multi-input)
+          const incomingIds = [
+            prevSpine.vertexId,
+            ...(stackedUnder.get(prevSpine.vertexId) ?? []),
+          ];
+          for (const fromId of incomingIds) {
+            await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId,
+              fromVertexId: fromId,
+              toVertexId: vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+            });
+          }
+        } else {
+          await this.createCanvasEdge({
+            repositoryId: args.repositoryId,
+            modelId,
+            fromVertexId: prevSpine.vertexId,
+            toVertexId: vertexId,
+            edgeType: "flow",
+            languageId: args.languageId,
+          });
+        }
       }
 
       if (node.kind === "process" && node.detailModelId) {
@@ -872,7 +1076,7 @@ export class ProcessWriter {
         });
       }
 
-      const entry = {
+      placed.push({
         title: node.title,
         kind: node.kind,
         objectType,
@@ -883,16 +1087,31 @@ export class ProcessWriter {
         width: size.width,
         height: size.height,
         detailModelId: node.detailModelId,
-      };
-      placed.push(entry);
-      prev = {
+      });
+      prevSpine = {
+        title: node.title,
+        kind: node.kind,
+        symbolId,
         vertexId,
         x: usedX,
         y: usedY,
         width: size.width,
         height: size.height,
+        detailModelId: node.detailModelId,
       };
     }
+
+    await this.placeExtraScopeIoStacked({
+      repositoryId: args.repositoryId,
+      modelId,
+      languageId: args.languageId,
+      owner: args.owner,
+      group: args.group,
+      symbolCache,
+      reserved,
+      gapY,
+      placed,
+    });
 
     let sideLoopIndex = 0;
     for (const loop of args.sideLoops ?? []) {
@@ -987,18 +1206,213 @@ export class ProcessWriter {
         placed,
         breakdowns,
         bridgeChecks: bridgeValidation.checks,
-        chainLength: args.chain.length,
+        chainUsed: chain,
+        chainLength: chain.length,
         sideLoopCount: args.sideLoops?.length ?? 0,
       },
       methodologyNotes: [
         "Process map: process chevrons + business objects on FLOW (not activities).",
+        "SCOPE: each process on the map uses the same input/output BOs as its detail model.",
+        "Multi I/O: one primary BO on the FLOW spine; extras stacked directly below with FLOW to process left (inputs) or from process right (outputs).",
+        "Prefer detailModelIds so the server derives the BO chain — do not invent overview BOs.",
         "Reuse process symbol UUIDs; breakdowns link detail models to those symbols.",
-        "Overview BO between processes must be the same symbol as detail output→input handoff.",
         "Side loops are supporting processes under a state BO.",
-        "Vertices are auto-nudged to avoid stacking on the same coordinates.",
+        ...lockNotes,
       ],
-      nextSuggestedTools: ["describe_process_map", "get_breakdowns"],
+      nextSuggestedTools: [
+        "describe_process_map",
+        "get_detail_process_scope",
+        "get_breakdowns",
+      ],
     };
+  }
+
+  /**
+   * After the spine is placed: any remaining detail-scope inputs/outputs that
+   * are not already on the canvas are stacked under the primary left/right BO
+   * (or under a column left/right of the process) with FLOW to L/R edges.
+   */
+  private async placeExtraScopeIoStacked(args: {
+    repositoryId: string;
+    modelId: string;
+    languageId: string;
+    owner?: string;
+    group?: string;
+    symbolCache: Map<string, string>;
+    reserved: Array<{ x: number; y: number; width: number; height: number }>;
+    gapY: number;
+    placed: Array<{
+      title: string;
+      kind: string;
+      objectType: string;
+      symbolId: string;
+      vertexId: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      detailModelId?: string;
+    }>;
+  }): Promise<void> {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/[\u00AC\u00AD]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const repoConfig = await this.getRepoConfig(args.repositoryId);
+    const boSize = this.sizeFor(repoConfig, "businessObject");
+    const gapX = 40;
+
+    const spineOrdered = args.placed
+      .filter((p) => p.kind === "process" || p.kind === "businessObject")
+      .slice()
+      .sort((a, b) => a.x - b.x || a.y - b.y);
+
+    for (let i = 0; i < spineOrdered.length; i++) {
+      const proc = spineOrdered[i]!;
+      if (proc.kind !== "process" || !proc.detailModelId) continue;
+
+      const scope = await this.reader.getDetailProcessScope({
+        repositoryId: args.repositoryId,
+        modelId: proc.detailModelId,
+      });
+
+      const leftBo = [...spineOrdered]
+        .slice(0, i)
+        .reverse()
+        .find((p) => p.kind === "businessObject" && Math.abs(p.y - proc.y) < 60);
+      const rightBo = spineOrdered
+        .slice(i + 1)
+        .find((p) => p.kind === "businessObject" && Math.abs(p.y - proc.y) < 60);
+
+      const already = new Set(
+        args.placed
+          .filter((p) => p.kind === "businessObject")
+          .flatMap((p) => [
+            p.symbolId,
+            norm(p.title),
+          ]),
+      );
+
+      const placeStacked = async (
+        bos: Array<{ title: string; symbolId?: string }>,
+        anchor: { x: number; y: number; width: number; height: number },
+        role: "input" | "output",
+      ) => {
+        let stackIndex = 0;
+        // If anchor is already a BO on spine, start stacking below it;
+        // count how many BOs already share this x column below anchor.
+        const colBos = args.placed.filter(
+          (p) =>
+            p.kind === "businessObject" &&
+            Math.abs(p.x - anchor.x) < 8 &&
+            p.y >= anchor.y,
+        );
+        stackIndex = Math.max(0, colBos.length - 1);
+
+        for (const bo of bos) {
+          if (
+            (bo.symbolId && already.has(bo.symbolId)) ||
+            already.has(norm(bo.title))
+          ) {
+            continue;
+          }
+          stackIndex += 1;
+          const x = Math.round(anchor.x);
+          const y = Math.round(
+            anchor.y + stackIndex * (boSize.height + args.gapY),
+          );
+          const symbolId =
+            bo.symbolId ??
+            (await this.resolveOrCreateSymbol({
+              repositoryId: args.repositoryId,
+              languageId: args.languageId,
+              title: bo.title,
+              objectType: "businessObject",
+              owner: args.owner,
+              group: args.group,
+              cache: args.symbolCache,
+            }));
+          const vertex = await this.placeVertex({
+            repositoryId: args.repositoryId,
+            modelId: args.modelId,
+            symbolId,
+            languageId: args.languageId,
+            title: bo.title,
+            objectType: "businessObject",
+            x,
+            y,
+            width: boSize.width,
+            height: boSize.height,
+            reserved: args.reserved,
+          });
+          const vertexId = String(vertex.uuid);
+          args.placed.push({
+            title: bo.title,
+            kind: "businessObject",
+            objectType: "businessObject",
+            symbolId,
+            vertexId,
+            x: vertex.x ?? x,
+            y: vertex.y ?? y,
+            width: boSize.width,
+            height: boSize.height,
+          });
+          already.add(symbolId);
+          already.add(norm(bo.title));
+          if (role === "input") {
+            await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId: args.modelId,
+              fromVertexId: vertexId,
+              toVertexId: proc.vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+            });
+          } else {
+            await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId: args.modelId,
+              fromVertexId: proc.vertexId,
+              toVertexId: vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+            });
+          }
+        }
+      };
+
+      const inputAnchor = leftBo ?? {
+        x: Math.round(proc.x - gapX - boSize.width),
+        y: proc.y,
+        width: boSize.width,
+        height: boSize.height,
+      };
+      const outputAnchor = rightBo ?? {
+        x: Math.round(proc.x + proc.width + gapX),
+        y: proc.y,
+        width: boSize.width,
+        height: boSize.height,
+      };
+
+      // Skip the primary already on spine (matched by left/right neighbor)
+      const extraInputs = scope.inputs.filter((inp) => {
+        if (leftBo && (leftBo.symbolId === inp.symbolId || norm(leftBo.title) === norm(inp.title))) {
+          return false;
+        }
+        return true;
+      });
+      const extraOutputs = scope.outputs.filter((out) => {
+        if (rightBo && (rightBo.symbolId === out.symbolId || norm(rightBo.title) === norm(out.title))) {
+          return false;
+        }
+        return true;
+      });
+
+      await placeStacked(extraInputs, inputAnchor, "input");
+      await placeStacked(extraOutputs, outputAnchor, "output");
+    }
   }
 
   /** Normalize edge type aliases to API UPPER_SNAKE values. */
@@ -1611,8 +2025,8 @@ export class ProcessWriter {
   }
 
   /**
-   * Nudge right, then down, until the box does not overlap occupied placements.
-   * Never leave two symbols on the exact same coordinates.
+   * Nudge down first, then right — avoids turning multi-I/O stacks into a
+   * horizontal sequence. Never leave two symbols on the same coordinates.
    */
   private findFreePlacement(
     occupied: Array<{ x: number; y: number; width: number; height: number }>,
@@ -1627,29 +2041,57 @@ export class ProcessWriter {
       occupied.some((o) =>
         this.boxesOverlap({ x: cx, y: cy, width, height }, o),
       );
-    let cx = Math.round(x);
-    let cy = Math.round(y);
-    if (!collides(cx, cy)) {
-      return { x: cx, y: cy, shifted: false };
+    const cx0 = Math.round(x);
+    const cy0 = Math.round(y);
+    if (!collides(cx0, cy0)) {
+      return { x: cx0, y: cy0, shifted: false };
     }
     for (let i = 1; i <= 100; i++) {
-      const rightX = Math.round(x) + i * stepX;
-      if (!collides(rightX, Math.round(y))) {
-        return { x: rightX, y: Math.round(y), shifted: true };
+      const downY = cy0 + i * stepY;
+      if (!collides(cx0, downY)) {
+        return { x: cx0, y: downY, shifted: true };
       }
-      const downY = Math.round(y) + i * stepY;
-      if (!collides(Math.round(x), downY)) {
-        return { x: Math.round(x), y: downY, shifted: true };
+      const rightX = cx0 + i * stepX;
+      if (!collides(rightX, cy0)) {
+        return { x: rightX, y: cy0, shifted: true };
       }
       if (!collides(rightX, downY)) {
         return { x: rightX, y: downY, shifted: true };
       }
     }
     return {
-      x: Math.round(x) + 100 * stepX,
-      y: Math.round(y) + stepY,
+      x: cx0,
+      y: cy0 + 100 * stepY,
       shifted: true,
     };
+  }
+
+  /**
+   * Group consecutive FLOW business objects so only the first stays on the
+   * spine; extras are stacked below (multi input/output layout).
+   */
+  private groupSpineNodes<T extends { kind: string }>(
+    nodes: T[],
+  ): Array<{ type: "bo-group"; items: T[] } | { type: "step"; item: T }> {
+    const groups: Array<
+      { type: "bo-group"; items: T[] } | { type: "step"; item: T }
+    > = [];
+    let i = 0;
+    while (i < nodes.length) {
+      const node = nodes[i]!;
+      if (node.kind === "businessObject") {
+        const items: T[] = [];
+        while (i < nodes.length && nodes[i]!.kind === "businessObject") {
+          items.push(nodes[i]!);
+          i += 1;
+        }
+        groups.push({ type: "bo-group", items });
+      } else {
+        groups.push({ type: "step", item: node });
+        i += 1;
+      }
+    }
+    return groups;
   }
 
   /**
@@ -1910,7 +2352,129 @@ export class ProcessWriter {
       return Y_ACTIVITY;
     };
 
-    for (const node of chain) {
+    const stackedUnder = new Map<string, string[]>();
+    const spineGroups = this.groupSpineNodes(
+      chain.map((n) => ({ ...n, kind: n.kind === "businessObject" ? "businessObject" : n.kind })),
+    );
+    // groupSpineNodes only groups kind==="businessObject"; other kinds stay as steps
+    const gapY = Math.max(distance.bottom, 12);
+
+    const placeChainBo = async (
+      node: (typeof chain)[number],
+      x: number,
+      y: number,
+      onSpine: boolean,
+    ) => {
+      const size = this.sizeFor(repoConfig, node.objectType);
+      const symbolId = await this.resolveOrCreateSymbol({
+        repositoryId: args.repositoryId,
+        languageId: args.languageId,
+        title: node.title,
+        objectType: node.objectType,
+        owner: args.owner,
+        group: args.group,
+        cache: symbolCache,
+      });
+      const vertex = await this.placeVertex({
+        repositoryId: args.repositoryId,
+        modelId,
+        symbolId,
+        languageId: args.languageId,
+        title: node.title,
+        objectType: node.objectType,
+        x,
+        y,
+        width: size.width,
+        height: size.height,
+        reserved,
+        spineAlign: onSpine,
+      });
+      const vertexId = String(vertex.uuid);
+      const usedX = vertex.x ?? x;
+      const usedY = vertex.y ?? y;
+      placed.push({
+        title: node.title,
+        objectType: node.objectType,
+        symbolId,
+        vertexId,
+        kind: node.kind,
+      });
+      vertexByTitle.set(node.title.toLowerCase(), {
+        vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+        kind: node.kind,
+      });
+      return { vertexId, x: usedX, y: usedY, width: size.width, height: size.height };
+    };
+
+    for (const group of spineGroups) {
+      if (group.type === "bo-group") {
+        const items = group.items as typeof chain;
+        const primaryNode = items[0]!;
+        const boSize = this.sizeFor(repoConfig, primaryNode.objectType);
+        const y = spineY("businessObject");
+        const primary = await placeChainBo(primaryNode, cursorX, y, true);
+
+        if (previousVertexId && previousTitle) {
+          const label =
+            previousKind === "gateway" || previousKind === "and"
+              ? branchLabel(previousTitle, primaryNode.title)
+              : undefined;
+          const edge = await this.createCanvasEdge({
+            repositoryId: args.repositoryId,
+            modelId,
+            fromVertexId: previousVertexId,
+            toVertexId: primary.vertexId,
+            edgeType: "flow",
+            languageId: args.languageId,
+            label,
+          });
+          connectedPairs.add(
+            `${previousTitle.toLowerCase()}→${primaryNode.title.toLowerCase()}`,
+          );
+          results.push({ flow: edge });
+        }
+
+        const stackedIds: string[] = [];
+        const prevWasStep =
+          previousKind === "activity" ||
+          previousKind === "gateway" ||
+          previousKind === "and" ||
+          previousKind === "process";
+        for (let si = 1; si < items.length; si++) {
+          const extra = items[si]!;
+          const sx = primary.x;
+          const sy = Math.round(
+            primary.y + primary.height + gapY + (si - 1) * (boSize.height + gapY),
+          );
+          const stacked = await placeChainBo(extra, sx, sy, false);
+          stackedIds.push(stacked.vertexId);
+          if (prevWasStep && previousVertexId) {
+            await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId,
+              fromVertexId: previousVertexId,
+              toVertexId: stacked.vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+            });
+            connectedPairs.add(
+              `${previousTitle!.toLowerCase()}→${extra.title.toLowerCase()}`,
+            );
+          }
+        }
+        stackedUnder.set(primary.vertexId, stackedIds);
+        previousVertexId = primary.vertexId;
+        previousTitle = primaryNode.title;
+        previousKind = "businessObject";
+        cursorX = primary.x + primary.width + distance.left;
+        continue;
+      }
+
+      const node = group.item as (typeof chain)[number];
       const size = this.sizeFor(repoConfig, node.objectType);
       const x = cursorX;
       const y = spineY(node.kind);
@@ -1935,6 +2499,7 @@ export class ProcessWriter {
         width: size.width,
         height: size.height,
         reserved,
+        spineAlign: true,
       });
       const vertexId = String(vertex.uuid);
       const usedX = vertex.x ?? x;
@@ -1960,19 +2525,41 @@ export class ProcessWriter {
           previousKind === "gateway" || previousKind === "and"
             ? branchLabel(previousTitle, node.title)
             : undefined;
-        const edge = await this.createCanvasEdge({
-          repositoryId: args.repositoryId,
-          modelId,
-          fromVertexId: previousVertexId,
-          toVertexId: vertexId,
-          edgeType: "flow",
-          languageId: args.languageId,
-          label,
-        });
-        connectedPairs.add(
-          `${previousTitle.toLowerCase()}→${node.title.toLowerCase()}`,
-        );
-        results.push({ flow: edge });
+        if (previousKind === "businessObject") {
+          const incoming = [
+            previousVertexId,
+            ...(stackedUnder.get(previousVertexId) ?? []),
+          ];
+          for (const fromId of incoming) {
+            const edge = await this.createCanvasEdge({
+              repositoryId: args.repositoryId,
+              modelId,
+              fromVertexId: fromId,
+              toVertexId: vertexId,
+              edgeType: "flow",
+              languageId: args.languageId,
+              label: fromId === previousVertexId ? label : undefined,
+            });
+            results.push({ flow: edge });
+          }
+          connectedPairs.add(
+            `${previousTitle.toLowerCase()}→${node.title.toLowerCase()}`,
+          );
+        } else {
+          const edge = await this.createCanvasEdge({
+            repositoryId: args.repositoryId,
+            modelId,
+            fromVertexId: previousVertexId,
+            toVertexId: vertexId,
+            edgeType: "flow",
+            languageId: args.languageId,
+            label,
+          });
+          connectedPairs.add(
+            `${previousTitle.toLowerCase()}→${node.title.toLowerCase()}`,
+          );
+          results.push({ flow: edge });
+        }
       }
       previousVertexId = vertexId;
       previousTitle = node.title;
@@ -2259,7 +2846,7 @@ export class ProcessWriter {
         ...(proposal.methodologyNotes ?? []),
         "Applied FLOW chain, RACI_RESPONSIBLE, CONTROLS and IS_USED_BY with reuse-first symbols.",
         "FLOW on activities/processes: left-in / right-out. Roles: one placement under each responsible activity (shared symbol, never fan-out edges).",
-        "Vertices are auto-nudged so symbols never stack on the same coordinates.",
+        "Multiple FLOW I/O BOs: primary on spine; extras stacked below with edges to activity left / from activity right.",
         ...(branches.length
           ? [
               "Applied gateway branches with FLOW edge labels (Ja/Nej). Side targets not on the spine are placed below the gateway.",

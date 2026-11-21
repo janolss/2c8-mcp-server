@@ -115,7 +115,7 @@ export function registerProposeTools(
     "propose_process_map_from_models",
     {
       description:
-        "Propose a process-map / overview chain from existing detail model IDs by matching shared business objects (output≈input). No writes — review uncertainLinks/readyForCreate, then validate_process_map_bridges → create_process_map. Does not invent bridges when details do not share a BO.",
+        "Propose overview chain FROM detail scopes only (get_detail_process_scope per model). BO titles/symbolIds come from detail inputs/outputs — never invent. Review readyForCreate, then create_process_map({ detailModelIds: same list }).",
       inputSchema: {
         repositoryId,
         modelIds: z
@@ -133,7 +133,7 @@ export function registerProposeTools(
     "validate_process_map_bridges",
     {
       description:
-        "Validate that overview FLOW business objects match detail handoffs: BO between process A and B must be an OUTPUT of A's detail and an INPUT of B's detail (prefer same symbol UUID). Call before create_process_map when detailModelId is set.",
+        "Validate overview SCOPE: each process's left/right BO must match that detail's inputs/outputs; handoff BO = prev OUTPUT ∩ next INPUT (same symbol). Call before create if building chain manually; prefer create_process_map(detailModelIds) instead.",
       inputSchema: {
         repositoryId,
         chain: z

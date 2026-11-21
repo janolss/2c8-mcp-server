@@ -283,11 +283,18 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "create_process_map",
     {
       description:
-        "Create a process map / overview: FLOW chain of businessObject ↔ process chevrons (not activities), optional sideLoops, optional breakdowns via detailModelId. When detailModelId is set, BO between processes MUST be prev detail OUTPUT and next detail INPUT (same symbol) — otherwise blocked. Never stacks vertices on the same coordinates.",
+        "Create a process map / overview. PREFERRED: pass detailModelIds (ordered detail UUIDs) — server derives BO↔process chain from each detail's inputs/outputs (same symbols). Do NOT invent overview BOs. Optional chain is locked to detail scopes when detailModelId is set. Validates scope; blocks mismatches. Never stacks vertices.",
       inputSchema: {
         repositoryId,
         languageId,
         title: z.string().min(1),
+        detailModelIds: z
+          .array(uuid)
+          .min(1)
+          .optional()
+          .describe(
+            "PREFERRED. Ordered detail model UUIDs left→right. Builds chain from get_detail_process_scope — overview I/O = detail I/O.",
+          ),
         chain: z
           .array(
             z.object({
@@ -299,7 +306,12 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
                 .describe("When kind=process: link breakdown to this detail model"),
             }),
           )
-          .min(1),
+          .optional()
+          .describe("Only if detailModelIds omitted; BOs will be rewritten from detail scopes when detailModelId is set"),
+        lockBosToDetailScope: z
+          .boolean()
+          .optional()
+          .describe("Default true when chain has detailModelId — replace BOs with detail inputs/outputs"),
         sideLoops: z
           .array(
             z.object({

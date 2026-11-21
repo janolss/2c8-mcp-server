@@ -132,13 +132,32 @@ export function registerConsumeTools(
     "describe_process_map",
     {
       description:
-        "Describe a process map / overview: process chevrons + business objects on FLOW, side loops, and breakdowns. Prefer over describe_process when the canvas has processes and no activities.",
+        "Describe a process map / overview: process chevrons + BOs on FLOW, side loops, breakdowns. Pass detailModelIds (left→right) to return scopeViolations when overview I/O ≠ detail I/O.",
       inputSchema: {
         repositoryId,
         modelId: uuid.describe("Overview model UUID"),
+        detailModelIds: z
+          .array(uuid)
+          .optional()
+          .describe(
+            "Optional detail model UUIDs in main-chain order — enables scopeChecks/scopeViolations",
+          ),
       },
     },
     async (args) => runTool(() => ctx.reader.describeProcessMap(args)),
+  );
+
+  server.registerTool(
+    "get_detail_process_scope",
+    {
+      description:
+        "Canonical inputs/outputs (with symbolIds) of a detail process model. REQUIRED before building an overview: the map must reuse these same BOs for that process — never invent different overview I/O.",
+      inputSchema: {
+        repositoryId,
+        modelId: uuid.describe("Detail process model UUID"),
+      },
+    },
+    async (args) => runTool(() => ctx.reader.getDetailProcessScope(args)),
   );
 
   server.registerTool(
