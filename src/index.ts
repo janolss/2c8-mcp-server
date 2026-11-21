@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `2c8 MCP server (stdio) started (writes=${config.allowWrites}, writeMode=${config.writeMode})`,
+    `2c8 MCP server (stdio) started (writes=${config.allowWrites}, deletes=${config.allowDeletes}, writeMode=${config.writeMode})`,
   );
 }
 

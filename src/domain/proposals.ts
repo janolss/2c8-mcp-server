@@ -1,12 +1,14 @@
 import type { MethodologyPack } from "../methodology/loader.js";
 import {
+  checkBusinessObjectValue,
   checkNaming,
   methodologyNotesForObject,
 } from "../methodology/rules-engine.js";
 
-/** Node on the main FLOW spine (business object or activity). */
+/** Node on the main FLOW spine (business object, activity, or rule/gateway). */
 export interface ProposedChainNode {
-  kind: "businessObject" | "activity";
+  /** gateway kind = exclusive Regel (Eller); create objectType is "or". */
+  kind: "businessObject" | "activity" | "gateway" | "and";
   title: string;
   objectType: string;
 }
@@ -21,6 +23,20 @@ export interface ProposedActivityDetail {
   usedBy: string[];
   /** Object type hint per usedBy title (default application vs core_document). */
   usedByTypes?: Record<string, string>;
+}
+
+/**
+ * Branch from a gateway (Regel Eller/vägval). Main-path answers that continue
+ * the chain should also appear here so FLOW edge labels (Ja/Nej) are applied.
+ * Side-path targets not in `chain` are created below the gateway on apply.
+ */
+export interface ProposedBranch {
+  fromTitle: string;
+  /** Answer on the FLOW edge label, e.g. Ja / Nej. */
+  label?: string;
+  toTitle: string;
+  toKind?: "businessObject" | "activity" | "gateway" | "and" | "process";
+  objectType?: string;
 }
 
 /** Legacy step shape kept for backward-compatible apply/Zod. */
@@ -41,10 +57,12 @@ export interface ModelProposal {
   title: string;
   /** Process chevron title (defaults to title). */
   processTitle?: string;
-  /** Ordered FLOW chain: BO → activity → BO → … */
+  /** Ordered FLOW chain: BO → activity → BO → … (may include gateway/and). Never join. */
   chain?: ProposedChainNode[];
   /** Activity-level RACI / CONTROLS / IS_USED_BY. */
   activities?: ProposedActivityDetail[];
+  /** Vägval/gateway branch edges (optional Ja/Nej labels). */
+  branches?: ProposedBranch[];
   /** Derived/legacy linear steps (compat). */
   steps: ProposedStep[];
   methodologyNotes: string[];
@@ -66,6 +84,11 @@ const OUTPUT_HINTS = /^(output|ut|resultat|utgång)\s*[:\-–]\s*/i;
 const PROCESS_TITLE = /^(process|processmodell|modell)\s*[:\-–]\s*/i;
 const APP_HINTS = /^(applikation|application|system|it-stöd|itstöd)\s*[:\-–]\s*/i;
 const USED_BY_HINTS = /^(används|mall|verktyg)\s*[:\-–]\s*/i;
+const GATEWAY_HINTS =
+  /^(vägval|vagval|gateway|decision|beslut|regel(?:\s*\((?:eller|och)\))?|eller|och-regel)\s*[:\-–]\s*/i;
+/** Ja:/Nej: or Ja → title */
+const BRANCH_HINTS =
+  /^(ja|nej|yes|no|gren|branch)\s*(?:[:\-–]|→|->)\s*/i;
 
 function capitalizeFirst(s: string): string {
   const t = s.trim();
@@ -84,6 +107,8 @@ function cleanTitle(line: string): string {
     .replace(PROCESS_TITLE, "")
     .replace(APP_HINTS, "")
     .replace(USED_BY_HINTS, "")
+    .replace(GATEWAY_HINTS, "")
+    .replace(BRANCH_HINTS, "")
     .trim();
 }
 
@@ -101,7 +126,28 @@ function guessObjectType(line: string): string {
   if (INPUT_HINTS.test(line) || OUTPUT_HINTS.test(line)) {
     return "businessObject";
   }
+  if (GATEWAY_HINTS.test(line)) {
+    return gatewayObjectTypeFromLine(line);
+  }
+  // Question ending with ? → exclusive gateway (vägval)
+  if (/\?\s*$/.test(line.trim()) && line.trim().length > 3) {
+    return "gateway";
+  }
   return "activity";
+}
+
+function gatewayObjectTypeFromLine(line: string): string {
+  const lower = line.toLowerCase();
+  if (/\boch\b/.test(lower) && /regel|och-regel/.test(lower)) return "and";
+  // Exclusive vägval → 2c8 create type "or" (Regel Eller)
+  return "or";
+}
+
+function gatewayKind(objectType: string): ProposedChainNode["kind"] {
+  const t = objectType.toLowerCase();
+  if (t === "and" || t === "och") return "and";
+  // kind "gateway" in proposals = exclusive; objectType must be "or"
+  return "gateway";
 }
 
 function stepsFromChain(
@@ -124,7 +170,7 @@ function stepsFromChain(
     }
     return {
       title: node.title,
-      objectType: "businessObject",
+      objectType: node.objectType,
     };
   });
 }
@@ -133,16 +179,58 @@ function buildNamingChecks(
   pack: MethodologyPack,
   chain: ProposedChainNode[],
   activities: ProposedActivityDetail[],
+  branches: ProposedBranch[] = [],
 ): ModelProposal["namingChecks"] {
   const checks: ModelProposal["namingChecks"] = [];
+  let previousActivityTitle: string | undefined;
   for (const node of chain) {
-    const c = checkNaming(pack, node.objectType, node.title);
-    checks.push({
-      title: node.title,
-      objectType: node.objectType,
-      pass: c.pass,
-      hint: c.hint,
-    });
+    if (node.kind === "businessObject") {
+      const c = checkBusinessObjectValue(
+        pack,
+        node.title,
+        previousActivityTitle,
+      );
+      checks.push({
+        title: node.title,
+        objectType: node.objectType,
+        pass: c.pass,
+        hint: c.hint,
+      });
+    } else if (node.kind === "gateway" || node.kind === "and") {
+      const c = checkNaming(pack, node.objectType, node.title);
+      checks.push({
+        title: node.title,
+        objectType: node.objectType,
+        pass: c.pass,
+        hint: c.hint,
+      });
+    } else {
+      const c = checkNaming(pack, node.objectType, node.title);
+      checks.push({
+        title: node.title,
+        objectType: node.objectType,
+        pass: c.pass,
+        hint: c.hint,
+      });
+      previousActivityTitle = node.title;
+    }
+  }
+  for (const b of branches) {
+    const ot = b.objectType ?? (b.toKind === "businessObject" ? "businessObject" : "activity");
+    if (
+      ot === "or" ||
+      ot === "gateway" ||
+      ot === "decision" ||
+      b.toKind === "gateway"
+    ) {
+      const c = checkNaming(pack, "or", b.toTitle);
+      checks.push({
+        title: b.toTitle,
+        objectType: "or",
+        pass: c.pass,
+        hint: c.hint,
+      });
+    }
   }
   for (const act of activities) {
     for (const p of act.performers) {
@@ -179,23 +267,38 @@ function finalizeProposal(
   chain: ProposedChainNode[],
   activities: ProposedActivityDetail[],
   extraNotes: string[] = [],
+  branches: ProposedBranch[] = [],
 ): ModelProposal {
   const steps = stepsFromChain(chain, activities);
+  const hasGateway =
+    chain.some((n) => n.kind === "gateway" || n.kind === "and") ||
+    branches.length > 0;
   return {
     modelType,
     title,
     processTitle: title,
     chain,
     activities,
+    branches: branches.length ? branches : undefined,
     steps,
     methodologyNotes: [
       ...methodologyNotesForObject(pack, "process"),
+      ...methodologyNotesForObject(pack, "businessObject"),
       "Proposal includes FLOW chain (business objects + activities), RACI performers, CONTROLS and IS_USED_BY.",
+      "FLOW business objects name value created (artefact/capability/outcome), not status echoes of the activity.",
+      ...(hasGateway
+        ? [
+            ...methodologyNotesForObject(pack, "gateway"),
+            "Vägval = Regel (Eller) = objectType or (NOT gateway). Call resolve_branching_object_type. Ja/Nej on branches[].label. NEVER join.",
+          ]
+        : []),
+      "Review failing namingChecks for business objects before apply_model_proposal.",
       "Search for reusable symbols before apply_model_proposal.",
       ...extraNotes,
     ],
-    namingChecks: buildNamingChecks(pack, chain, activities),
+    namingChecks: buildNamingChecks(pack, chain, activities, branches),
     nextSuggestedTools: [
+      "resolve_branching_object_type",
       "validate_against_methodology",
       "search_symbols",
       "apply_model_proposal",
@@ -529,7 +632,10 @@ function proposeFromPrefixedLines(
   let title = "Ny process";
   const chain: ProposedChainNode[] = [];
   const activities: ProposedActivityDetail[] = [];
+  const branches: ProposedBranch[] = [];
   let pendingPerformers: string[] = [];
+  let pendingGatewayTitle: string | undefined;
+  let gatewayBranchCount = 0;
   const docs: string[] = [];
   const usedBy: string[] = [];
   const usedByTypes: Record<string, string> = {};
@@ -544,6 +650,42 @@ function proposeFromPrefixedLines(
     });
   };
 
+  const pushActivity = (stepTitle: string) => {
+    chain.push({
+      kind: "activity",
+      title: stepTitle,
+      objectType: "activity",
+    });
+    activities.push({
+      title: stepTitle,
+      performers: [...pendingPerformers],
+      controlledBy: [...docs],
+      usedBy: [...usedBy],
+      usedByTypes: { ...usedByTypes },
+    });
+    pendingPerformers = [];
+    docs.length = 0;
+    usedBy.length = 0;
+    for (const k of Object.keys(usedByTypes)) delete usedByTypes[k];
+  };
+
+  const resolveBranchTarget = (
+    raw: string,
+  ): { title: string; kind: ProposedChainNode["kind"]; objectType: string } => {
+    const t = raw.trim();
+    if (/\?\s*$/.test(t)) {
+      return { title: t, kind: "gateway", objectType: "or" };
+    }
+    if (/^(process|processmodell)\s*[:\-–]/i.test(t)) {
+      return {
+        title: cleanTitle(t),
+        kind: "activity",
+        objectType: "activity",
+      };
+    }
+    return { title: cleanTitle(t) || t, kind: "activity", objectType: "activity" };
+  };
+
   for (const line of lines) {
     if (PROCESS_TITLE.test(line) || (chain.length === 0 && !line.includes(":") && lines.indexOf(line) === 0)) {
       if (PROCESS_TITLE.test(line) || lines.indexOf(line) === 0) {
@@ -552,7 +694,12 @@ function proposeFromPrefixedLines(
           title = cleaned;
           continue;
         }
-        if (lines.indexOf(line) === 0 && !ACTIVITY_HINTS.test(line)) {
+        if (
+          lines.indexOf(line) === 0 &&
+          !ACTIVITY_HINTS.test(line) &&
+          !GATEWAY_HINTS.test(line) &&
+          !BRANCH_HINTS.test(line)
+        ) {
           title = cleaned || title;
           continue;
         }
@@ -582,35 +729,86 @@ function proposeFromPrefixedLines(
       continue;
     }
 
+    // Vägval / Regel / Gateway
+    if (GATEWAY_HINTS.test(line)) {
+      for (const inp of inputs) flushBo(inp);
+      inputs.length = 0;
+      const ot = gatewayObjectTypeFromLine(line);
+      const kind = gatewayKind(ot);
+      const stepTitle = cleanTitle(line);
+      if (!stepTitle) continue;
+      chain.push({ kind, title: stepTitle, objectType: ot });
+      pendingGatewayTitle = kind === "gateway" || kind === "and" ? stepTitle : undefined;
+      gatewayBranchCount = 0;
+      continue;
+    }
+
+    // Ja: / Nej: / Ja → … after a gateway
+    if (BRANCH_HINTS.test(line) && pendingGatewayTitle) {
+      const labelMatch = line.match(BRANCH_HINTS);
+      const labelRaw = labelMatch?.[1] ?? "";
+      const label =
+        /^(ja|yes)$/i.test(labelRaw)
+          ? "Ja"
+          : /^(nej|no)$/i.test(labelRaw)
+            ? "Nej"
+            : capitalizeFirst(labelRaw);
+      const targetRaw = line.replace(BRANCH_HINTS, "").trim();
+      if (!targetRaw) continue;
+      const target = resolveBranchTarget(targetRaw);
+      gatewayBranchCount += 1;
+      branches.push({
+        fromTitle: pendingGatewayTitle,
+        label,
+        toTitle: target.title,
+        toKind: target.kind,
+        objectType: target.objectType,
+      });
+      // First answer continues on the main spine; further answers are side branches
+      if (gatewayBranchCount === 1) {
+        if (target.kind === "gateway" || target.kind === "and") {
+          chain.push({
+            kind: target.kind,
+            title: target.title,
+            objectType: target.objectType,
+          });
+          pendingGatewayTitle = target.title;
+          gatewayBranchCount = 0;
+        } else if (target.kind === "businessObject") {
+          flushBo(target.title);
+        } else {
+          pushActivity(target.title);
+        }
+      }
+      continue;
+    }
+
     const objectType = guessObjectType(line);
     const stepTitle = cleanTitle(line);
     if (!stepTitle) continue;
+
+    if (objectType === "gateway" || objectType === "and") {
+      for (const inp of inputs) flushBo(inp);
+      inputs.length = 0;
+      const kind = gatewayKind(objectType);
+      chain.push({ kind, title: stepTitle, objectType });
+      pendingGatewayTitle = kind === "gateway" || kind === "and" ? stepTitle : undefined;
+      gatewayBranchCount = 0;
+      continue;
+    }
 
     if (objectType === "activity") {
       for (const inp of inputs) flushBo(inp);
       inputs.length = 0;
 
-      chain.push({
-        kind: "activity",
-        title: stepTitle,
-        objectType: "activity",
-      });
-      activities.push({
-        title: stepTitle,
-        performers: [...pendingPerformers],
-        controlledBy: [...docs],
-        usedBy: [...usedBy],
-        usedByTypes: { ...usedByTypes },
-      });
-      pendingPerformers = [];
-      docs.length = 0;
-      usedBy.length = 0;
-      for (const k of Object.keys(usedByTypes)) delete usedByTypes[k];
+      pushActivity(stepTitle);
 
       for (const out of outputs) flushBo(out);
       outputs.length = 0;
+      pendingGatewayTitle = undefined;
     } else if (objectType === "businessObject") {
       flushBo(stepTitle);
+      pendingGatewayTitle = undefined;
     } else if (objectType === "role") {
       pendingPerformers.push(normalizeRole(stepTitle));
     } else if (objectType === "core_document") {
@@ -620,6 +818,11 @@ function proposeFromPrefixedLines(
       usedByTypes[stepTitle] = "application";
     }
   }
+
+  for (const out of outputs) flushBo(out);
+  outputs.length = 0;
+  for (const inp of inputs) flushBo(inp);
+  inputs.length = 0;
 
   if (chain.length === 0) {
     for (const line of lines.slice(0, 20)) {
@@ -636,9 +839,22 @@ function proposeFromPrefixedLines(
     }
   }
 
-  return finalizeProposal(pack, modelType, title, chain, activities, [
-    "Extracted from prefixed / structured lines.",
-  ]);
+  return finalizeProposal(
+    pack,
+    modelType,
+    title,
+    chain,
+    activities,
+    [
+      "Extracted from prefixed / structured lines.",
+      ...(branches.length
+        ? [
+            "Parsed vägval/gateway branches — review branches[].label (Ja/Nej) before apply.",
+          ]
+        : []),
+    ],
+    branches,
+  );
 }
 
 /**
@@ -677,18 +893,41 @@ export function proposeModelFromDocument(
 /** Ensure chain/activities exist when only legacy steps were supplied. */
 export function normalizeProposal(proposal: ModelProposal): ModelProposal {
   if (proposal.chain?.length && proposal.activities) {
-    return proposal;
+    return {
+      ...proposal,
+      processTitle: proposal.processTitle ?? proposal.title,
+      branches: proposal.branches ?? [],
+    };
   }
   const chain: ProposedChainNode[] = [];
   const activities: ProposedActivityDetail[] = [];
   for (const step of proposal.steps) {
-    const ot = step.objectType.toLowerCase();
+    const ot = step.objectType.toLowerCase().replace(/[_\s-]/g, "");
     if (ot.includes("business") || ot === "businessobject") {
       chain.push({
         kind: "businessObject",
         title: step.title,
         objectType: "businessObject",
       });
+    } else if (
+      ot === "gateway" ||
+      ot === "decision" ||
+      ot === "vägval" ||
+      ot === "vagval" ||
+      ot === "eller" ||
+      ot === "or" ||
+      ot === "xor"
+    ) {
+      chain.push({
+        kind: "gateway",
+        title: step.title,
+        objectType: "or",
+      });
+    } else if (ot === "and" || ot === "och") {
+      chain.push({ kind: "and", title: step.title, objectType: "and" });
+    } else if (ot === "join" || ot.includes("forbind") || ot.includes("förbind")) {
+      // Join forbidden — skip silently (agents must not place join)
+      continue;
     } else {
       chain.push({
         kind: "activity",
@@ -710,6 +949,7 @@ export function normalizeProposal(proposal: ModelProposal): ModelProposal {
     processTitle: proposal.processTitle ?? proposal.title,
     chain,
     activities,
+    branches: proposal.branches ?? [],
     steps: stepsFromChain(chain, activities),
   };
 }

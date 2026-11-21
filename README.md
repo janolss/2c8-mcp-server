@@ -17,6 +17,7 @@ Methodology: curated pack under [`knowledge/`](knowledge/) (based on
 - MCP **resources** (`methodology://…`), **prompts**, and server **instructions**
 - Rules from knowledge pack + repository `configuration`
 - Writes behind `TWO_C8_ALLOW_WRITES` with `TWO_C8_WRITE_MODE=draft|direct`
+- Deletes behind `TWO_C8_ALLOW_DELETES` (`delete_model`)
 
 ## Requirements
 
@@ -38,6 +39,7 @@ npm run build
 | `TWO_C8_BASE_URL` | *(required)* | MT backend base URL |
 | `TWO_C8_API_KEY` | *(required)* | API key (`x-api-key`) |
 | `TWO_C8_ALLOW_WRITES` | `false` | Register write tools |
+| `TWO_C8_ALLOW_DELETES` | `false` | Register `delete_model` |
 | `TWO_C8_WRITE_MODE` | `draft` | `draft` or `direct` |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `PORT` | `3000` | HTTP port |

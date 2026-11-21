@@ -11,6 +11,12 @@ import type {
   VertexView,
 } from "../api/types.js";
 import { pickTitle, titleMatches } from "../util/titles.js";
+import {
+  GATEWAY_SEARCH_HINT,
+  isForbiddenJoinType,
+  isGatewayAlias,
+  matchesObjectTypeFilter,
+} from "../util/object-types.js";
 
 const PROCESS_TYPE_HINTS = ["process", "swimlane", "simbane"];
 
@@ -27,6 +33,22 @@ const RESPONSIBILITY_TYPES = new Set([
 
 /** Executable steps in a process model (excludes PROCESS map objects). */
 const ACTIVITY_TYPES = new Set(["activity", "aktivitet"]);
+
+/** Process chevrons on overview / process-map canvases. */
+const PROCESS_OBJECT_TYPES = new Set(["process"]);
+
+/** Vägval = Regel (Eller)=or; also and; legacy DECISION. */
+const DECISION_TYPES = new Set([
+  "decision",
+  "or",
+  "eller",
+  "and",
+  "och",
+  "gateway",
+  "regel",
+  "vägval",
+  "vagval",
+]);
 
 const APPLICATION_TYPES = new Set([
   "application",
@@ -372,6 +394,8 @@ export class ProcessReader {
         title: titleOf(v),
         x: v.x,
         y: v.y,
+        width: v.width,
+        height: v.height,
         hasDocument: v.hasDocument,
         inputs: [],
         outputs: [],
@@ -571,6 +595,9 @@ export class ProcessReader {
     const businessObjects = steps.filter((s) =>
       BUSINESS_OBJECT_TYPES.has(normType(s.objectType)),
     );
+    const decisions = steps.filter((s) =>
+      DECISION_TYPES.has(normType(s.objectType)),
+    );
 
     // Start inputs: business objects not produced by an in-model activity
     const processInputs = businessObjects.filter(
@@ -621,6 +648,25 @@ export class ProcessReader {
         };
       });
 
+    const decisionNarrative = decisions
+      .slice()
+      .sort((a, b) => (a.x ?? 0) - (b.x ?? 0) || (a.y ?? 0) - (b.y ?? 0))
+      .map((d) => {
+        const branchOut = [
+          ...(d.outputs ?? []),
+          ...(d.otherRelations ?? []).filter((r) => r.direction === "out"),
+        ]
+          .map((o) => o.title)
+          .filter(Boolean);
+        return {
+          title: d.title,
+          objectType: d.objectType,
+          symbolId: d.symbolId,
+          vertexId: d.vertexId,
+          branches: branchOut,
+        };
+      });
+
     const summaryLines: string[] = [];
     const modelTitle = flow.modelTitle ?? (overview.title as string) ?? "Process";
     summaryLines.push(`${modelTitle}:`);
@@ -645,6 +691,11 @@ export class ProcessReader {
       }
       summaryLines.push(`- ${parts.join(" ")}`);
     }
+    for (const d of decisionNarrative) {
+      const branches =
+        d.branches.length > 0 ? ` → ${d.branches.join(" | ")}` : "";
+      summaryLines.push(`- Vägval: ${d.title ?? "(utan titel)"}${branches}`);
+    }
     if (processOutputs.length) {
       summaryLines.push(
         `Slutresultat: ${processOutputs.map((o) => o.title).filter(Boolean).join("; ")}.`,
@@ -667,6 +718,7 @@ export class ProcessReader {
         vertexId: s.vertexId,
       })),
       activities: narrativeSteps,
+      decisions: decisionNarrative,
       outputs: processOutputs.map((s) => ({
         title: s.title,
         objectType: s.objectType,
@@ -678,8 +730,154 @@ export class ProcessReader {
       methodologyNotes: [
         "Prefer describe_process for human-readable process narratives.",
         "Edge types FLOW / RACI_RESPONSIBLE / IS_USED_BY are grouped into inputs, outputs, responsible, applications.",
+        "Vägval/gateways (Regel Eller) appear under decisions; branch answers belong on FLOW edge labels. Join is never used.",
       ],
-      nextSuggestedTools: ["get_breakdowns", "get_object_documents"],
+      nextSuggestedTools:
+        activities.length === 0 &&
+        steps.some((s) => PROCESS_OBJECT_TYPES.has(normType(s.objectType)))
+          ? ["describe_process_map", "get_breakdowns"]
+          : ["get_breakdowns", "get_object_documents"],
+      kind:
+        activities.length === 0 &&
+        steps.some((s) => PROCESS_OBJECT_TYPES.has(normType(s.objectType)))
+          ? "process-map-candidate"
+          : "activity-process",
+    };
+  }
+
+  /**
+   * Narrative for process maps / overviews (process chevrons + BO, not activities).
+   */
+  async describeProcessMap(args: {
+    repositoryId: string;
+    modelId: string;
+  }): Promise<Record<string, unknown>> {
+    const [overview, flow, breakdownsResult] = await Promise.all([
+      this.getOverview(args),
+      this.getFlow({ ...args, includeDocuments: true }),
+      this.getBreakdowns(args).catch(() => ({ breakdowns: [] })),
+    ]);
+
+    const steps = flow.steps;
+    const processes = steps
+      .filter((s) => PROCESS_OBJECT_TYPES.has(normType(s.objectType)))
+      .slice()
+      .sort((a, b) => (a.x ?? 0) - (b.x ?? 0) || (a.y ?? 0) - (b.y ?? 0));
+    const businessObjects = steps.filter((s) =>
+      BUSINESS_OBJECT_TYPES.has(normType(s.objectType)),
+    );
+
+    const spineMidY =
+      processes.length > 0
+        ? processes.reduce((s, p) => s + (p.y ?? 0) + (p.height ?? 50) / 2, 0) /
+          processes.length
+        : 178;
+
+    const mainProcesses = processes.filter(
+      (p) => Math.abs((p.y ?? 0) + (p.height ?? 50) / 2 - spineMidY) < 80,
+    );
+    const sideLoops = processes.filter(
+      (p) => !mainProcesses.some((m) => m.vertexId === p.vertexId),
+    );
+
+    // Order main chain left-to-right mixing BO and process by x
+    const spine = [...businessObjects, ...mainProcesses]
+      .filter((s) => {
+        if (PROCESS_OBJECT_TYPES.has(normType(s.objectType))) return true;
+        // BO on spine: near midline
+        const mid = (s.y ?? 0) + (s.height ?? 18) / 2;
+        return Math.abs(mid - spineMidY) < 80;
+      })
+      .sort((a, b) => (a.x ?? 0) - (b.x ?? 0));
+
+    const chainNarrative = spine.map((s) => ({
+      kind: PROCESS_OBJECT_TYPES.has(normType(s.objectType))
+        ? "process"
+        : "businessObject",
+      title: s.title,
+      symbolId: s.symbolId,
+      vertexId: s.vertexId,
+      objectType: s.objectType,
+    }));
+
+    const sideLoopNarrative = sideLoops.map((p) => {
+      const linkedBos = [
+        ...(p.inputs ?? []),
+        ...(p.outputs ?? []),
+      ].filter((x) => BUSINESS_OBJECT_TYPES.has(normType(x.objectType)));
+      const boTitles = [
+        ...new Set(linkedBos.map((b) => b.title).filter(Boolean)),
+      ];
+      return {
+        title: p.title,
+        symbolId: p.symbolId,
+        vertexId: p.vertexId,
+        linkedBusinessObjects: boTitles,
+      };
+    });
+
+    // Breakdowns on this overview model (broken-down-from is on detail — also list per process via find if empty)
+    const breakdowns = breakdownsResult.breakdowns;
+
+    const modelTitle =
+      flow.modelTitle ?? (overview.title as string) ?? "Processkarta";
+    const summaryLines: string[] = [`${modelTitle} (processkarta):`];
+    if (chainNarrative.length) {
+      summaryLines.push(
+        `Huvudkedja: ${chainNarrative.map((n) => n.title).join(" → ")}.`,
+      );
+    }
+    for (const p of mainProcesses) {
+      const inputs = (p.inputs ?? [])
+        .filter((i) => BUSINESS_OBJECT_TYPES.has(normType(i.objectType)))
+        .map((i) => i.title)
+        .filter(Boolean);
+      const outputs = (p.outputs ?? [])
+        .filter((o) => BUSINESS_OBJECT_TYPES.has(normType(o.objectType)))
+        .map((o) => o.title)
+        .filter(Boolean);
+      summaryLines.push(
+        `- ${p.title}${inputs.length ? ` ← ${inputs.join(", ")}` : ""}${outputs.length ? ` → ${outputs.join(", ")}` : ""}`,
+      );
+    }
+    for (const s of sideLoopNarrative) {
+      summaryLines.push(
+        `- Sidoloop: ${s.title}${s.linkedBusinessObjects.length ? ` (kopplad till ${s.linkedBusinessObjects.join(", ")})` : ""}`,
+      );
+    }
+
+    return {
+      kind: "process-map",
+      overview: {
+        uuid: overview.uuid,
+        title: modelTitle,
+        modelType: overview.modelType,
+        version: overview.version,
+        vertexCount: overview.vertexCount,
+        edgeCount: overview.edgeCount,
+      },
+      chain: chainNarrative,
+      processes: mainProcesses.map((p) => ({
+        title: p.title,
+        symbolId: p.symbolId,
+        vertexId: p.vertexId,
+        inputs: (p.inputs ?? [])
+          .filter((i) => BUSINESS_OBJECT_TYPES.has(normType(i.objectType)))
+          .map((i) => i.title),
+        outputs: (p.outputs ?? [])
+          .filter((o) => BUSINESS_OBJECT_TYPES.has(normType(o.objectType)))
+          .map((o) => o.title),
+      })),
+      sideLoops: sideLoopNarrative,
+      breakdowns,
+      summaryText: summaryLines.join("\n"),
+      steps,
+      methodologyNotes: [
+        "Process map: process chevrons + business objects on FLOW (not activities).",
+        "Use get_breakdowns on each detail model, or create_process_map with detailModelId.",
+        "Prefer describe_process_map for overviews; describe_process for activity-level models.",
+      ],
+      nextSuggestedTools: ["get_breakdowns", "create_process_map", "link_breakdown"],
     };
   }
 
@@ -741,6 +939,370 @@ export class ProcessReader {
       breakdowns: page.data ?? page,
       methodologyNotes: [
         "Breakdowns navigate from high-level processes to detailed activity models.",
+      ],
+    };
+  }
+
+  /**
+   * Overview BO between two detail processes must exist in both details
+   * (output of previous ≈ input of next). Prefer same symbol UUID.
+   */
+  async validateProcessMapBoBridges(args: {
+    repositoryId: string;
+    chain: Array<{
+      kind: "businessObject" | "process";
+      title: string;
+      symbolId?: string;
+      detailModelId?: string;
+    }>;
+  }): Promise<{
+    ok: boolean;
+    checks: Array<Record<string, unknown>>;
+    errors: string[];
+    methodologyNotes: string[];
+  }> {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/[\u00AC\u00AD]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    type DetailIO = {
+      modelId: string;
+      inputs: Array<{ title?: string; symbolId?: string }>;
+      outputs: Array<{ title?: string; symbolId?: string }>;
+      allBos: Array<{ title?: string; symbolId?: string }>;
+    };
+    const cache = new Map<string, DetailIO>();
+    const loadDetail = async (modelId: string): Promise<DetailIO> => {
+      const hit = cache.get(modelId);
+      if (hit) return hit;
+      const described = (await this.describeProcess({
+        repositoryId: args.repositoryId,
+        modelId,
+      })) as {
+        inputs?: Array<{ title?: string; symbolId?: string }>;
+        outputs?: Array<{ title?: string; symbolId?: string }>;
+        steps?: Array<{
+          objectType?: string;
+          title?: string;
+          symbolId?: string;
+        }>;
+      };
+      const allBos = (described.steps ?? []).filter((s) => {
+        const t = (s.objectType ?? "").toLowerCase().replace(/[\s_-]/g, "");
+        return t === "businessobject" || t === "bo";
+      });
+      const io: DetailIO = {
+        modelId,
+        inputs: described.inputs ?? [],
+        outputs: described.outputs ?? [],
+        allBos: allBos.map((b) => ({
+          title: b.title,
+          symbolId: b.symbolId,
+        })),
+      };
+      cache.set(modelId, io);
+      return io;
+    };
+
+    const matchesBo = (
+      bo: { title: string; symbolId?: string },
+      candidates: Array<{ title?: string; symbolId?: string }>,
+    ): { hit: boolean; by: "symbolId" | "title" | null } => {
+      if (bo.symbolId) {
+        const byId = candidates.find((c) => c.symbolId === bo.symbolId);
+        if (byId) return { hit: true, by: "symbolId" };
+      }
+      const byTitle = candidates.find(
+        (c) => c.title && norm(c.title) === norm(bo.title),
+      );
+      if (byTitle) return { hit: true, by: "title" };
+      return { hit: false, by: null };
+    };
+
+    const checks: Array<Record<string, unknown>> = [];
+    const errors: string[] = [];
+    const chain = args.chain;
+
+    for (let i = 0; i < chain.length; i++) {
+      const node = chain[i];
+      if (!node || node.kind !== "businessObject") continue;
+      const prev = chain[i - 1];
+      const next = chain[i + 1];
+      const prevDetail =
+        prev?.kind === "process" ? prev.detailModelId : undefined;
+      const nextDetail =
+        next?.kind === "process" ? next.detailModelId : undefined;
+
+      if (prevDetail && nextDetail) {
+        const prevIo = await loadDetail(prevDetail);
+        const nextIo = await loadDetail(nextDetail);
+        const inPrevAsOutput = matchesBo(node, prevIo.outputs);
+        const inNextAsInput = matchesBo(node, nextIo.inputs);
+        const presentInPrev = matchesBo(node, prevIo.allBos);
+        const presentInNext = matchesBo(node, nextIo.allBos);
+        const strictOk = inPrevAsOutput.hit && inNextAsInput.hit;
+        checks.push({
+          bridgeTitle: node.title,
+          symbolId: node.symbolId,
+          previousProcess: prev?.title,
+          previousDetailModelId: prevDetail,
+          nextProcess: next?.title,
+          nextDetailModelId: nextDetail,
+          inPreviousOutputs: inPrevAsOutput,
+          inNextInputs: inNextAsInput,
+          presentInPreviousDetail: presentInPrev.hit,
+          presentInNextDetail: presentInNext.hit,
+          ok: strictOk,
+        });
+        if (!strictOk) {
+          errors.push(
+            `Overview BO "${node.title}" between "${prev?.title}" and "${next?.title}" is invalid: ` +
+              `it must be an OUTPUT of detail ${prevDetail} and an INPUT of detail ${nextDetail} ` +
+              `(prefer the same symbol UUID). ` +
+              `prevOutputs=[${prevIo.outputs.map((o) => o.title).join(", ")}]; ` +
+              `nextInputs=[${nextIo.inputs.map((o) => o.title).join(", ")}].`,
+          );
+        }
+        continue;
+      }
+
+      if (!prev && nextDetail) {
+        const nextIo = await loadDetail(nextDetail);
+        const inNext = matchesBo(node, nextIo.inputs);
+        checks.push({
+          bridgeTitle: node.title,
+          role: "leading-input",
+          nextDetailModelId: nextDetail,
+          inNextInputs: inNext,
+          ok: inNext.hit,
+        });
+        if (!inNext.hit) {
+          errors.push(
+            `Overview leading BO "${node.title}" must be an INPUT of detail ${nextDetail} ` +
+              `(inputs=[${nextIo.inputs.map((o) => o.title).join(", ")}]).`,
+          );
+        }
+        continue;
+      }
+
+      if (prevDetail && !next) {
+        const prevIo = await loadDetail(prevDetail);
+        const inPrev = matchesBo(node, prevIo.outputs);
+        checks.push({
+          bridgeTitle: node.title,
+          role: "trailing-output",
+          previousDetailModelId: prevDetail,
+          inPreviousOutputs: inPrev,
+          ok: inPrev.hit,
+        });
+        if (!inPrev.hit) {
+          errors.push(
+            `Overview trailing BO "${node.title}" must be an OUTPUT of detail ${prevDetail} ` +
+              `(outputs=[${prevIo.outputs.map((o) => o.title).join(", ")}]).`,
+          );
+        }
+      }
+    }
+
+    return {
+      ok: errors.length === 0,
+      checks,
+      errors,
+      methodologyNotes: [
+        "Overview BO between processes = the handoff object: previous detail OUTPUT and next detail INPUT (same symbol).",
+        "Example: if detail A ends with BO X, detail B must start with BO X before X may appear on the overview FLOW.",
+      ],
+    };
+  }
+
+  /**
+   * Propose a process-map chain from existing detail models by matching
+   * shared business objects (output of A ≈ input of B). Review before create_process_map.
+   */
+  async proposeProcessMapFromModels(args: {
+    repositoryId: string;
+    modelIds: string[];
+    title?: string;
+  }): Promise<Record<string, unknown>> {
+    const norm = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/[\u00AC\u00AD]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    type ModelIO = {
+      modelId: string;
+      processTitle: string;
+      processSymbolId?: string;
+      inputs: string[];
+      outputs: string[];
+    };
+
+    const models: ModelIO[] = [];
+    for (const modelId of args.modelIds) {
+      const described = (await this.describeProcess({
+        repositoryId: args.repositoryId,
+        modelId,
+      })) as {
+        overview?: { title?: string };
+        inputs?: Array<{ title?: string }>;
+        outputs?: Array<{ title?: string }>;
+        steps?: Array<{
+          objectType?: string;
+          title?: string;
+          symbolId?: string;
+          x?: number;
+          y?: number;
+        }>;
+      };
+      const processChevron = (described.steps ?? []).find(
+        (s) =>
+          PROCESS_OBJECT_TYPES.has(normType(s.objectType)) &&
+          (s.x ?? 999) < 100,
+      );
+      const processTitle =
+        processChevron?.title ??
+        described.overview?.title ??
+        "Okänd process";
+      models.push({
+        modelId,
+        processTitle,
+        processSymbolId: processChevron?.symbolId,
+        inputs: (described.inputs ?? [])
+          .map((i) => i.title)
+          .filter((t): t is string => Boolean(t)),
+        outputs: (described.outputs ?? [])
+          .map((o) => o.title)
+          .filter((t): t is string => Boolean(t)),
+      });
+    }
+
+    // Greedy chain: start with models whose inputs are not produced by others
+    const remaining = [...models];
+    const ordered: ModelIO[] = [];
+    const produced = new Set<string>();
+
+    while (remaining.length) {
+      let idx = remaining.findIndex((m) =>
+        m.inputs.every(
+          (i) =>
+            !remaining.some(
+              (o) => o !== m && o.outputs.some((out) => norm(out) === norm(i)),
+            ),
+        ),
+      );
+      if (idx < 0) {
+        // Prefer model whose input matches something already produced
+        idx = remaining.findIndex((m) =>
+          m.inputs.some((i) => produced.has(norm(i))),
+        );
+      }
+      if (idx < 0) idx = 0;
+      const next = remaining.splice(idx, 1)[0]!;
+      ordered.push(next);
+      for (const o of next.outputs) produced.add(norm(o));
+    }
+
+    const chain: Array<{
+      kind: "businessObject" | "process";
+      title: string;
+      symbolId?: string;
+      detailModelId?: string;
+      confidence: "high" | "medium" | "low";
+      note?: string;
+    }> = [];
+
+    const uncertainLinks: string[] = [];
+
+    for (let i = 0; i < ordered.length; i++) {
+      const m = ordered[i]!;
+      const prev = ordered[i - 1];
+
+      let inputBo = m.inputs[0];
+      let sharedBo: string | undefined;
+      if (prev) {
+        sharedBo = m.inputs.find((inp) =>
+          prev.outputs.some((out) => norm(out) === norm(inp)),
+        );
+        if (sharedBo) {
+          inputBo = sharedBo;
+        } else {
+          uncertainLinks.push(
+            `BLOCKING: "${prev.processTitle}" outputs [${prev.outputs.join(", ")}] ` +
+              `do not share a business object with "${m.processTitle}" inputs [${m.inputs.join(", ")}]. ` +
+              `Fix detail models so the previous OUTPUT symbol exists as the next INPUT before using it on the overview.`,
+          );
+        }
+      }
+
+      if (i === 0 && inputBo) {
+        chain.push({
+          kind: "businessObject",
+          title: inputBo,
+          confidence: "medium",
+        });
+      } else if (i > 0 && sharedBo) {
+        chain.push({
+          kind: "businessObject",
+          title: sharedBo,
+          confidence: "high",
+          note: "Shared detail handoff (prev output = next input)",
+        });
+      } else if (i > 0 && !sharedBo) {
+        chain.push({
+          kind: "businessObject",
+          title: `MISSING_SHARED_BO (${prev?.processTitle} → ${m.processTitle})`,
+          confidence: "low",
+          note: "Do not create_process_map until details share the same BO symbol",
+        });
+      }
+
+      chain.push({
+        kind: "process",
+        title: m.processTitle,
+        symbolId: m.processSymbolId,
+        detailModelId: m.modelId,
+        confidence: m.processSymbolId ? "high" : "medium",
+      });
+
+      if (i === ordered.length - 1 && m.outputs[0]) {
+        chain.push({
+          kind: "businessObject",
+          title: m.outputs[0],
+          confidence: "medium",
+        });
+      }
+    }
+
+    return {
+      title: args.title ?? "Processöversikt",
+      chain,
+      models: ordered.map((m) => ({
+        modelId: m.modelId,
+        processTitle: m.processTitle,
+        processSymbolId: m.processSymbolId,
+        inputs: m.inputs,
+        outputs: m.outputs,
+      })),
+      uncertainLinks,
+      readyForCreate:
+        uncertainLinks.filter((u) => u.startsWith("BLOCKING:")).length === 0,
+      methodologyNotes: [
+        "Proposal only — review BO value naming and order, then create_process_map.",
+        "Overview BO between two processes MUST be the same symbol as previous detail OUTPUT and next detail INPUT.",
+        "create_process_map validates this and blocks when detailModelId links fail the handoff check.",
+        "Reuse processSymbolId on the map; detailModelId creates breakdowns.",
+        "Side loops (supporting processes) are not inferred — add via sideLoops on create_process_map.",
+      ],
+      nextSuggestedTools: [
+        "search_symbols",
+        "validate_process_map_bridges",
+        "create_process_map",
+        "describe_process_map",
       ],
     };
   }
@@ -855,6 +1417,30 @@ export class ProcessReader {
     startAt?: string;
     maxResults?: string;
   }): Promise<Record<string, unknown>> {
+    // Agents often search query="vägval"/"gateway" as if it were a title —
+    // reinterpret as objectType so they hit DECISION + gateway diamonds.
+    let query = args.query?.trim();
+    let objectType = args.objectType?.trim();
+    if (query && !objectType && (isGatewayAlias(query) || isForbiddenJoinType(query))) {
+      objectType = query;
+      query = undefined;
+    }
+    if (objectType && isForbiddenJoinType(objectType)) {
+      return {
+        total: 0,
+        symbols: [],
+        methodologyNotes: [
+          "Join/förbinda is forbidden — do not search or create it. Use objectType=gateway (vägval) for exclusive choice.",
+          GATEWAY_SEARCH_HINT,
+        ],
+        nextSuggestedTools: ["get_methodology", "search_symbols"],
+      };
+    }
+
+    const gatewayNotes = objectType && isGatewayAlias(objectType)
+      ? [GATEWAY_SEARCH_HINT]
+      : [];
+
     // Scope to symbols placed on a model canvas when modelId is set
     if (args.modelId) {
       const canvas = await this.client.request<CanvasDto>({
@@ -876,16 +1462,13 @@ export class ProcessReader {
         symbolIds: ids,
       });
       let symbols = resolved.symbols;
-      if (args.objectType) {
-        const ot = args.objectType.toLowerCase();
+      if (objectType) {
         symbols = symbols.filter((s) =>
-          String(s.objectType ?? "")
-            .toLowerCase()
-            .includes(ot),
+          matchesObjectTypeFilter(String(s.objectType ?? ""), objectType!),
         );
       }
-      if (args.query) {
-        const q = args.query.toLowerCase();
+      if (query) {
+        const q = query.toLowerCase();
         symbols = symbols.filter((s) =>
           String(s.title ?? "")
             .toLowerCase()
@@ -898,33 +1481,38 @@ export class ProcessReader {
         scopedToModelId: args.modelId,
         methodologyNotes: [
           "Results limited to symbols placed on the given model canvas.",
+          ...gatewayNotes,
         ],
         nextSuggestedTools: ["resolve_symbols", "reuse_symbol"],
       };
     }
 
+    // For gateway-type filters without a title query: fetch a wider page and
+    // filter client-side (API title filter would miss DECISION diamonds).
+    const useTitleFilter = Boolean(query) && !isGatewayAlias(query ?? "");
     const page = await this.client.request<Page<SymbolView>>({
       path: "/api/v1/repositories/{repositoryId}/symbols",
       pathParams: { repositoryId: args.repositoryId },
       query: {
         startAt: args.startAt,
-        maxResults: args.maxResults ?? "100",
+        maxResults: args.maxResults ?? (objectType && isGatewayAlias(objectType) ? "500" : "100"),
         projection: "ALL",
-        ...(args.query
-          ? { filter: toWildcardFilter(args.query), filterFields: "titles" }
+        ...(useTitleFilter
+          ? { filter: toWildcardFilter(query!), filterFields: "titles" }
           : {}),
       },
     });
 
     let symbols = page.data ?? [];
-    if (args.objectType) {
-      const ot = args.objectType.toLowerCase();
+    if (objectType) {
       symbols = symbols.filter((s) =>
-        (s.objectType ?? "").toLowerCase().includes(ot),
+        matchesObjectTypeFilter(s.objectType, objectType!),
       );
     }
-    if (args.query) {
-      symbols = symbols.filter((s) => titleMatches(s.titles, args.query!));
+    if (query && useTitleFilter) {
+      symbols = symbols.filter((s) => titleMatches(s.titles, query!));
+    } else if (query) {
+      symbols = symbols.filter((s) => titleMatches(s.titles, query!));
     }
 
     return {
@@ -939,6 +1527,7 @@ export class ProcessReader {
       methodologyNotes: [
         "Prefer reusing an existing symbol UUID over creating a duplicate with the same title.",
         "Pass modelId to search only symbols used on a specific model.",
+        ...gatewayNotes,
       ],
       nextSuggestedTools: ["reuse_symbol", "add_process_step", "find_symbol_usage"],
     };

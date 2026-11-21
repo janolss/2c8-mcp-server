@@ -1,0 +1,42 @@
+id: process-map
+# Conceptual layer on PROCESS_MODEL — not a separate API modelType.
+apiModelTypeHints:
+  - process-map
+  - processmap
+  - processkarta
+  - översikt
+  - overview
+title:
+  sv: Processkarta / översikt
+  en: Process map / overview
+summary: >
+  A process map (overview) is a PROCESS_MODEL whose FLOW spine uses process
+  chevrons and business objects — not activities. Each process symbol is
+  typically broken down to a detail model with activities. Distinct from a
+  huvudprocesskarta (top-level lednings/kärn/stöd layout).
+principles:
+  - Overview = process objects + value business objects on FLOW
+  - Detail = activities with performers inside breakdown models
+  - Reuse the same process symbol UUID on the map and as the breakdown target
+  - Side loops (supporting processes) attach under a state BO, not as main-chain steps
+  - >
+    Overview BO between process A and B = same symbol as A's detail OUTPUT and
+    B's detail INPUT (handoff continuity). Never invent an overview-only BO.
+  - Never stack vertices on identical coordinates
+modelingGuidance:
+  - Use objectType process (chevron) on the overview canvas; never place activity steps here
+  - Name business objects as value/artefacts between processes (same value-stream rules)
+  - >
+    Before create_process_map with detailModelId: call validate_process_map_bridges.
+    If detail A ends with BO X, detail B must include X as input before X is on the map.
+  - >
+    Link each process chevron to its detail model via breakdown
+    (body symbol = processSymbolUuid)
+  - Supporting processes under employment (e.g. leave) use a side loop from/to a state BO
+  - Align symbols on one baseline; space with repository quickdraw distance; never overlap
+  - Huvudprocesskarta (lednings/kärn/stöd bands, PDCA) is a separate top-level pattern — not this linear map
+phase1: true
+sources:
+  - https://support.2c8.com/hc/sv/articles/7185436499741-Processmodell
+  - https://support.2c8.com/hc/sv/articles/5260682580637-Hur-skapar-jag-en-nedbrytning
+  - https://support.2c8.com/hc/sv/articles/20825108975773-Huvudprocesskarta

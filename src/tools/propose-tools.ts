@@ -28,7 +28,7 @@ const proposedStepSchema = z.object({
 });
 
 const chainNodeSchema = z.object({
-  kind: z.enum(["businessObject", "activity"]),
+  kind: z.enum(["businessObject", "activity", "gateway", "and"]),
   title: z.string(),
   objectType: z.string(),
 });
@@ -41,12 +41,26 @@ const activityDetailSchema = z.object({
   usedByTypes: z.record(z.string(), z.string()).optional(),
 });
 
+const branchSchema = z.object({
+  fromTitle: z.string().describe("Vägval / gateway / decision title"),
+  label: z.string().optional().describe("FLOW edge label, e.g. Ja / Nej"),
+  toTitle: z.string(),
+  toKind: z
+    .enum(["businessObject", "activity", "gateway", "and", "process"])
+    .optional(),
+  objectType: z.string().optional(),
+});
+
 const proposalSchema = z.object({
   modelType: z.string(),
   title: z.string(),
   processTitle: z.string().optional(),
   chain: z.array(chainNodeSchema).optional(),
   activities: z.array(activityDetailSchema).optional(),
+  branches: z
+    .array(branchSchema)
+    .optional()
+    .describe("Gateway branches with optional Ja/Nej edge labels"),
   steps: z.array(proposedStepSchema),
   methodologyNotes: z.array(z.string()).optional(),
   namingChecks: z
@@ -70,7 +84,7 @@ export function registerProposeTools(
     "propose_model_from_text",
     {
       description:
-        "Text-to-model: parse free text (Swedish narrative or prefixed lines) into a structured process proposal with FLOW chain, RACI, CONTROLS and IS_USED_BY (no writes). Review, search_symbols, then apply_model_proposal.",
+        "Text-to-model → FLOW + RACI/CONTROLS/IS_USED_BY + vägval branches. Prefixed: 'Vägval: Finns X?' / 'Ja: …' / 'Nej: …'. Exclusive choice objectType is \"or\" (Regel Eller) — call resolve_branching_object_type first. NEVER gateway or join.",
       inputSchema: {
         text: z.string().min(1),
         modelType: z.string().optional().describe("Defaults to process"),
@@ -97,12 +111,53 @@ export function registerProposeTools(
       runTool(async () => proposeModelFromDocument(ctx.pack, args)),
   );
 
+  server.registerTool(
+    "propose_process_map_from_models",
+    {
+      description:
+        "Propose a process-map / overview chain from existing detail model IDs by matching shared business objects (output≈input). No writes — review uncertainLinks/readyForCreate, then validate_process_map_bridges → create_process_map. Does not invent bridges when details do not share a BO.",
+      inputSchema: {
+        repositoryId,
+        modelIds: z
+          .array(uuid)
+          .min(1)
+          .describe("Detail process model UUIDs to place on the overview"),
+        title: z.string().optional().describe("Suggested overview title"),
+      },
+    },
+    async (args) =>
+      runTool(() => ctx.reader.proposeProcessMapFromModels(args)),
+  );
+
+  server.registerTool(
+    "validate_process_map_bridges",
+    {
+      description:
+        "Validate that overview FLOW business objects match detail handoffs: BO between process A and B must be an OUTPUT of A's detail and an INPUT of B's detail (prefer same symbol UUID). Call before create_process_map when detailModelId is set.",
+      inputSchema: {
+        repositoryId,
+        chain: z
+          .array(
+            z.object({
+              kind: z.enum(["businessObject", "process"]),
+              title: z.string().min(1),
+              symbolId: uuid.optional(),
+              detailModelId: uuid.optional(),
+            }),
+          )
+          .min(1),
+      },
+    },
+    async (args) =>
+      runTool(() => ctx.reader.validateProcessMapBoBridges(args)),
+  );
+
   if (ctx.writer) {
     server.registerTool(
       "apply_model_proposal",
       {
         description:
-          "Apply a process proposal: create model, FLOW chain (BO↔activity), RACI_RESPONSIBLE, CONTROLS, IS_USED_BY, process chevron. Reuse-first for symbols.",
+          "Apply proposal: FLOW (BO↔activity↔or/vägval), branches with Ja/Nej, RACI/CONTROLS/IS_USED_BY. Exclusive choice creates as objectType or (Regel Eller). NEVER gateway/join.",
         inputSchema: {
           repositoryId,
           languageId,

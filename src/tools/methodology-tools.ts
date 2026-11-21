@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
+import { resolveBranchingObjectType } from "../domain/branching-resolve.js";
 import {
   extractAllowedTypes,
   getMethodologyTopic,
@@ -15,16 +16,41 @@ export function registerMethodologyTools(
   ctx: ToolContext,
 ): void {
   server.registerTool(
+    "resolve_branching_object_type",
+    {
+      description:
+        "REQUIRED before creating a branch/choice symbol. Translates agent jargon (gateway, vägval, decision, xor, parallel, …) into the real 2c8 methodology object type. 2c8 has NO gateway type — exclusive choice = Regel (Eller) objectType \"or\"; parallel = Regel (Och) objectType \"and\". Join is forbidden. Call this whenever the user/agent says gateway or vägval.",
+      inputSchema: {
+        ask: z
+          .string()
+          .min(1)
+          .describe(
+            "What the agent wants, e.g. gateway, vägval, decision, xor, parallel, and, eller, och",
+          ),
+      },
+    },
+    async ({ ask }) =>
+      runTool(async () => ({
+        ...resolveBranchingObjectType(ask),
+        methodologyNotes: [
+          "2c8 methodology object types for branching are only: or (Regel Eller / vägval) and and (Regel Och).",
+          'Never create objectType "gateway" or "join".',
+          "Pass useObjectType from this tool into add_process_step / propose chain / apply_model_proposal.",
+        ],
+      })),
+  );
+
+  server.registerTool(
     "get_methodology",
     {
       description:
-        "Load 2c8 methodology guidance for a topic (object type, model type, rule, documents, structure). Use before modeling decisions.",
+        "Load 2c8 methodology for a topic. For branching ALWAYS prefer resolve_branching_object_type first (gateway→or). Topics: vägval, or, and, process, naming, …",
       inputSchema: {
         topic: z
           .string()
           .min(1)
           .describe(
-            "e.g. process, activity, role, swimlane, naming, reuse-first, document-links, breakdowns",
+            "e.g. vägval, or, and, process, process-map, activity, naming, business-objects, reuse-first",
           ),
       },
     },
@@ -65,14 +91,20 @@ export function registerMethodologyTools(
     "validate_against_methodology",
     {
       description:
-        "Validate a proposed symbol (objectType + title) against naming rules and repository configuration before write.",
+        "Validate a proposed symbol (objectType + title) against naming rules and repository configuration before write. For businessObject, pass previousActivityTitle to detect status-echo names.",
       inputSchema: {
         repositoryId: repositoryId.optional(),
         objectType: z.string().min(1),
         title: z.string().min(1),
+        previousActivityTitle: z
+          .string()
+          .optional()
+          .describe(
+            "When objectType is businessObject: preceding activity title, to flag status echoes like 'Godkänd X' after 'Godkänna X'",
+          ),
       },
     },
-    async ({ repositoryId: id, objectType, title }) =>
+    async ({ repositoryId: id, objectType, title, previousActivityTitle }) =>
       runTool(async () => {
         const repoConfig = id
           ? await loadRepoConfiguration(ctx.client, id)
@@ -81,6 +113,7 @@ export function registerMethodologyTools(
           objectType,
           title,
           repoConfig,
+          previousActivityTitle,
         });
         return {
           ...result,

@@ -28,6 +28,19 @@ const LABEL_OUTSIDE_MAX_WIDTH = 60;
 const Y_BASE = 120;
 const Y_BO = 135;
 const Y_ACTIVITY = 119;
+/** Gateway/decision diamond — centered on activity midline (30×30). */
+const Y_GATEWAY = 129;
+/** Vertical offset for side branches off a gateway. */
+const BRANCH_Y_OFFSET = 160;
+/** Shared vertical midline for FLOW spine (BO + process/activity). */
+const SPINE_MID_Y = 178;
+/**
+ * Inset on process LEFT (incoming) only — matches Lättkrängt (~15–20% of width).
+ * Outgoing RIGHT uses the AABB edge (no inset).
+ */
+const PROCESS_EDGE_INSET = 0.2;
+/** Extra stub when routing around a process (side loops / reverse direction). */
+const PROCESS_ROUTE_STUB = 24;
 
 /** 2c8 soft line-break (UI often shows this as "¬"). */
 const SOFT_HYPHEN = "\u00AD";
@@ -95,6 +108,11 @@ function applySoftBreaks(title: string): string {
  * Models use UPPER_SNAKE (PROCESS_MODEL); most symbols accept lower/upper,
  * but businessobject must be BUSINESS_OBJECT.
  */
+/**
+ * Map methodology/agent object types to 2c8 create API types.
+ * Vägval (Regel Eller/Och) are both API objectType "decision";
+ * exclusive vs parallel is selected via alternativeSymbol OR|AND.
+ */
 function toApiObjectType(objectType: string): string {
   const key = objectType.trim().toLowerCase().replace(/[_\s]/g, "");
   const map: Record<string, string> = {
@@ -108,10 +126,43 @@ function toApiObjectType(objectType: string): string {
     position: "position",
     organization: "organization",
     organisation: "organization",
+    // Exclusive vägval → DECISION (alternativeSymbol OR, API default)
+    gateway: "decision",
+    decision: "decision",
+    vägval: "decision",
+    vagval: "decision",
+    regel: "decision",
+    eller: "decision",
+    or: "decision",
+    xor: "decision",
+    beslut: "decision",
+    // Parallel Regel (Och) → same DECISION type, alternativeSymbol AND
+    and: "decision",
+    och: "decision",
+    parallel: "decision",
   };
+  // Join / Förbinda is forbidden in this MCP
+  if (
+    key === "join" ||
+    key.includes("forbind") ||
+    key.includes("förbind")
+  ) {
+    throw new Error(
+      'objectType join/förbinda is forbidden. For vägval use objectType "or"/"decision" (Regel Eller). Call resolve_branching_object_type.',
+    );
+  }
   if (map[key]) return map[key];
   if (objectType.includes("_")) return objectType.toLowerCase();
   return objectType.toLowerCase();
+}
+
+/** Parallel Regel (Och) needs alternativeSymbol AND on DECISION create. */
+function alternativeSymbolFor(objectType: string): "AND" | undefined {
+  const key = objectType.trim().toLowerCase().replace(/[_\s]/g, "");
+  if (key === "and" || key === "och" || key === "parallel" || key === "parallell") {
+    return "AND";
+  }
+  return undefined;
 }
 
 /** Map methodology modelType hints to API model type ids (UPPER_SNAKE). */
@@ -344,6 +395,31 @@ export class ProcessWriter {
     };
   }
 
+  /**
+   * Permanently delete a model. Gated by TWO_C8_ALLOW_DELETES (tool registration).
+   */
+  async deleteModel(args: { repositoryId: string; modelId: string }) {
+    await this.client.request({
+      method: "DELETE",
+      path: "/api/v1/repositories/{repositoryId}/models/{modelId}",
+      pathParams: {
+        repositoryId: args.repositoryId,
+        modelId: args.modelId,
+      },
+    });
+    return {
+      data: {
+        deleted: true,
+        repositoryId: args.repositoryId,
+        modelId: args.modelId,
+      },
+      methodologyNotes: [
+        "Model deleted via DELETE /repositories/{repositoryId}/models/{modelId}. This is irreversible.",
+      ],
+      nextSuggestedTools: ["find_models", "list_repositories"],
+    };
+  }
+
   async addProcessStep(args: {
     repositoryId: string;
     modelId: string;
@@ -393,12 +469,14 @@ export class ProcessWriter {
     }
 
     if (!symbolId) {
+      const alt = alternativeSymbolFor(logicalType);
       const symbol = (await this.client.request({
         method: "POST",
         path: "/api/v1/repositories/{repositoryId}/symbols",
         pathParams: { repositoryId: args.repositoryId },
         body: {
           objectType,
+          ...(alt ? { alternativeSymbol: alt } : {}),
           titles: { [args.languageId]: { title: args.title } },
           ...(args.owner ? { owner: args.owner } : {}),
           ...(args.group ? { group: args.group } : {}),
@@ -417,12 +495,33 @@ export class ProcessWriter {
         repositoryId: args.repositoryId,
         modelId: args.modelId,
       },
-    })) as { vertices?: Array<{ x?: number; y?: number }> };
+    })) as {
+      vertices?: Array<{
+        uuid?: string;
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+      }>;
+    };
 
-    const count = canvas.vertices?.length ?? 0;
-    const stepGap = size.width + distance.left;
-    const x = args.x ?? 80 + count * stepGap;
-    const y = args.y ?? Y_BASE;
+    const gapX = Math.max(distance.right, distance.left, 40);
+    let x = args.x;
+    let y = args.y;
+    if (x === undefined || y === undefined) {
+      const prev = args.connectFromVertexId
+        ? (canvas.vertices ?? []).find((v) => v.uuid === args.connectFromVertexId)
+        : undefined;
+      if (prev && prev.x !== undefined && prev.width !== undefined) {
+        x = x ?? Math.round(prev.x + prev.width + gapX);
+        const prevMid =
+          (prev.y ?? SPINE_MID_Y) + Math.floor((prev.height ?? size.height) / 2);
+        y = y ?? Math.round(prevMid - size.height / 2);
+      } else {
+        x = x ?? 50;
+        y = y ?? Math.round(SPINE_MID_Y - size.height / 2);
+      }
+    }
 
     const vertex = await this.placeVertex({
       repositoryId: args.repositoryId,
@@ -454,7 +553,10 @@ export class ProcessWriter {
 
     return {
       data: { symbolId, vertex, edge },
-      methodologyNotes: validation.methodologyNotes,
+      methodologyNotes: [
+        ...validation.methodologyNotes,
+        "Placement avoids overlapping existing canvas vertices (auto-nudge if needed).",
+      ],
       namingCheck: validation.namingCheck,
       reuseCandidates,
       configViolations: validation.configViolations,
@@ -505,6 +607,7 @@ export class ProcessWriter {
       data: vertex,
       methodologyNotes: [
         "Reused existing symbol UUID — changes to the symbol propagate across models. Size from repository symbolsizes.",
+        "Placement avoids overlapping existing canvas vertices (auto-nudge if needed).",
       ],
       nextSuggestedTools: ["set_activity_performer", "create_canvas_edge"],
     };
@@ -528,8 +631,373 @@ export class ProcessWriter {
       data: created,
       methodologyNotes: [
         "Breakdown links this model as a detailing of a symbol or edge in another model.",
+        "Preferred write body: { symbol: \"<overviewSymbolUuid>\" }. Prefer link_breakdown.",
       ],
       nextSuggestedTools: ["get_breakdowns", "get_process_flow"],
+    };
+  }
+
+  /**
+   * Link a detail model as breakdown of an overview symbol (process chevron).
+   * POST body is { symbol: overviewSymbolId } on the detail model.
+   */
+  async linkBreakdown(args: {
+    repositoryId: string;
+    detailModelId: string;
+    overviewSymbolId: string;
+  }) {
+    try {
+      const created = await this.client.request({
+        method: "POST",
+        path: "/api/v1/repositories/{repositoryId}/models/{modelId}/broken-down-from",
+        pathParams: {
+          repositoryId: args.repositoryId,
+          modelId: args.detailModelId,
+        },
+        body: { symbol: args.overviewSymbolId },
+      });
+      return {
+        data: created,
+        methodologyNotes: [
+          "Breakdown: detail model elaborates the overview process symbol (reuse same UUID on the map).",
+        ],
+        nextSuggestedTools: ["get_breakdowns", "describe_process_map"],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Idempotent: same symbol→detail link already present
+      if (/\b409\b/.test(msg) || /already exists/i.test(msg)) {
+        return {
+          data: {
+            alreadyLinked: true,
+            detailModelId: args.detailModelId,
+            overviewSymbolId: args.overviewSymbolId,
+          },
+          methodologyNotes: [
+            "Breakdown already existed for this symbol/detail pair — left as-is.",
+          ],
+          nextSuggestedTools: ["get_breakdowns", "describe_process_map"],
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Create a process map / overview: BO ↔ process chevrons on FLOW,
+   * optional side loops, optional breakdowns to detail models.
+   */
+  async createProcessMap(args: {
+    repositoryId: string;
+    languageId: string;
+    title: string;
+    chain: Array<{
+      kind: "businessObject" | "process";
+      title: string;
+      symbolId?: string;
+      detailModelId?: string;
+    }>;
+    sideLoops?: Array<{
+      fromBoTitle: string;
+      processTitle: string;
+      symbolId?: string;
+      detailModelId?: string;
+      placement?: "below";
+    }>;
+    permissionGroup?: string;
+    owner?: string;
+    group?: string;
+    modelId?: string;
+  }) {
+    const hasDetailLinks = args.chain.some(
+      (n) => n.kind === "process" && n.detailModelId,
+    );
+    const bridgeValidation = hasDetailLinks
+      ? await this.reader.validateProcessMapBoBridges({
+          repositoryId: args.repositoryId,
+          chain: args.chain,
+        })
+      : { ok: true, checks: [], errors: [] as string[] };
+    if (!bridgeValidation.ok) {
+      throw new Error(
+        `create_process_map blocked — overview business objects must match detail I/O:\n` +
+          bridgeValidation.errors.join("\n"),
+      );
+    }
+
+    const repoConfig = await this.getRepoConfig(args.repositoryId);
+    const { distance } = this.layoutGaps(repoConfig);
+    const gapX = Math.max(distance.right, distance.left, 40);
+    const gapY = Math.max(distance.bottom, 30);
+    const rowGap = 140;
+    const symbolCache = new Map<string, string>();
+    const reserved: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }> = [];
+
+    let modelId = args.modelId;
+    const appending = Boolean(args.modelId);
+    if (!modelId) {
+      const created = await this.createProcessModel({
+        repositoryId: args.repositoryId,
+        title: args.title,
+        languageId: args.languageId,
+        modelType: "process",
+        permissionGroup: args.permissionGroup,
+        owner: args.owner,
+        group: args.group,
+      });
+      modelId =
+        (created.data as { uuid?: string })?.uuid ??
+        (created.data as { model?: { uuid?: string } })?.model?.uuid;
+      if (!modelId) {
+        throw new Error(
+          "create_process_map: could not resolve modelId; pass modelId explicitly.",
+        );
+      }
+    }
+
+    // Keep BO + process on one midline; when appending, start a new row below
+    // existing content instead of colliding with the first spine.
+    let spineMidY = SPINE_MID_Y;
+    if (appending) {
+      const canvas = (await this.client.request({
+        path: "/api/v1/repositories/{repositoryId}/models/{modelId}/canvas",
+        pathParams: {
+          repositoryId: args.repositoryId,
+          modelId,
+        },
+      })) as {
+        vertices?: Array<{
+          x?: number;
+          y?: number;
+          width?: number;
+          height?: number;
+        }>;
+      };
+      let maxBottom = 0;
+      for (const v of canvas.vertices ?? []) {
+        const bottom = (v.y ?? 0) + (v.height ?? 0);
+        if (bottom > maxBottom) maxBottom = bottom;
+      }
+      if ((canvas.vertices?.length ?? 0) > 0) {
+        spineMidY = Math.round(maxBottom + rowGap);
+      }
+    }
+
+    const placed: Array<{
+      title: string;
+      kind: string;
+      objectType: string;
+      symbolId: string;
+      vertexId: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      detailModelId?: string;
+    }> = [];
+    const breakdowns: unknown[] = [];
+
+    let prev: {
+      vertexId: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } | null = null;
+
+    for (const node of args.chain) {
+      const objectType =
+        node.kind === "process" ? "process" : "businessObject";
+      const size = this.sizeFor(repoConfig, objectType);
+      const symbolId =
+        node.symbolId ??
+        (await this.resolveOrCreateSymbol({
+          repositoryId: args.repositoryId,
+          languageId: args.languageId,
+          title: node.title,
+          objectType,
+          owner: args.owner,
+          group: args.group,
+          cache: symbolCache,
+        }));
+
+      const placeX: number = prev
+        ? Math.round(prev.x + prev.width + gapX)
+        : 50;
+      const placeY: number = Math.round(spineMidY - size.height / 2);
+
+      const vertex = await this.placeVertex({
+        repositoryId: args.repositoryId,
+        modelId,
+        symbolId,
+        languageId: args.languageId,
+        title: node.title,
+        objectType,
+        x: placeX,
+        y: placeY,
+        width: size.width,
+        height: size.height,
+        reserved,
+        spineAlign: true,
+      });
+      const vertexId = String(vertex.uuid);
+      const usedX = vertex.x ?? placeX;
+      const usedY = vertex.y ?? placeY;
+      if (prev) {
+        await this.createCanvasEdge({
+          repositoryId: args.repositoryId,
+          modelId,
+          fromVertexId: prev.vertexId,
+          toVertexId: vertexId,
+          edgeType: "flow",
+          languageId: args.languageId,
+        });
+      }
+
+      if (node.kind === "process" && node.detailModelId) {
+        const bd = await this.linkBreakdown({
+          repositoryId: args.repositoryId,
+          detailModelId: node.detailModelId,
+          overviewSymbolId: symbolId,
+        });
+        breakdowns.push({
+          detailModelId: node.detailModelId,
+          overviewSymbolId: symbolId,
+          result: bd.data,
+        });
+      }
+
+      const entry = {
+        title: node.title,
+        kind: node.kind,
+        objectType,
+        symbolId,
+        vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+        detailModelId: node.detailModelId,
+      };
+      placed.push(entry);
+      prev = {
+        vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+      };
+    }
+
+    let sideLoopIndex = 0;
+    for (const loop of args.sideLoops ?? []) {
+      const bo = placed.find(
+        (p) =>
+          p.kind === "businessObject" &&
+          p.title.toLowerCase() === loop.fromBoTitle.trim().toLowerCase(),
+      );
+      if (!bo) {
+        throw new Error(
+          `create_process_map: sideLoop fromBoTitle '${loop.fromBoTitle}' not found on chain`,
+        );
+      }
+      const size = this.sizeFor(repoConfig, "process");
+      const symbolId =
+        loop.symbolId ??
+        (await this.resolveOrCreateSymbol({
+          repositoryId: args.repositoryId,
+          languageId: args.languageId,
+          title: loop.processTitle,
+          objectType: "process",
+          owner: args.owner,
+          group: args.group,
+          cache: symbolCache,
+        }));
+      const x = Math.round(bo.x + Math.floor(bo.width / 2) - size.width / 2);
+      const y = Math.round(
+        bo.y + bo.height + gapY + sideLoopIndex * (size.height + gapY),
+      );
+      sideLoopIndex += 1;
+
+      const vertex = await this.placeVertex({
+        repositoryId: args.repositoryId,
+        modelId,
+        symbolId,
+        languageId: args.languageId,
+        title: loop.processTitle,
+        objectType: "process",
+        x,
+        y,
+        width: size.width,
+        height: size.height,
+        reserved,
+      });
+      const vertexId = String(vertex.uuid);
+      const usedX = vertex.x ?? x;
+      const usedY = vertex.y ?? y;
+
+      // Side attachment under a state BO: one FLOW BO → process.
+      // Do NOT add process → same BO (looks like a nonsense double link).
+      // True employment-style loops that return to the state BO should be
+      // modeled explicitly with a separate return path when needed.
+      await this.createCanvasEdge({
+        repositoryId: args.repositoryId,
+        modelId,
+        fromVertexId: bo.vertexId,
+        toVertexId: vertexId,
+        edgeType: "flow",
+        languageId: args.languageId,
+      });
+
+      if (loop.detailModelId) {
+        const bd = await this.linkBreakdown({
+          repositoryId: args.repositoryId,
+          detailModelId: loop.detailModelId,
+          overviewSymbolId: symbolId,
+        });
+        breakdowns.push({
+          detailModelId: loop.detailModelId,
+          overviewSymbolId: symbolId,
+          result: bd.data,
+        });
+      }
+
+      placed.push({
+        title: loop.processTitle,
+        kind: "sideLoop",
+        objectType: "process",
+        symbolId,
+        vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+        detailModelId: loop.detailModelId,
+      });
+    }
+
+    return {
+      data: {
+        modelId,
+        placed,
+        breakdowns,
+        bridgeChecks: bridgeValidation.checks,
+        chainLength: args.chain.length,
+        sideLoopCount: args.sideLoops?.length ?? 0,
+      },
+      methodologyNotes: [
+        "Process map: process chevrons + business objects on FLOW (not activities).",
+        "Reuse process symbol UUIDs; breakdowns link detail models to those symbols.",
+        "Overview BO between processes must be the same symbol as detail output→input handoff.",
+        "Side loops are supporting processes under a state BO.",
+        "Vertices are auto-nudged to avoid stacking on the same coordinates.",
+      ],
+      nextSuggestedTools: ["describe_process_map", "get_breakdowns"],
     };
   }
 
@@ -544,6 +1012,8 @@ export class ProcessWriter {
       control: "CONTROLS",
       isusedby: "IS_USED_BY",
       usedby: "IS_USED_BY",
+      isfollowedby: "IS_FOLLOWED_BY",
+      followedby: "IS_FOLLOWED_BY",
     };
     if (map[key]) return map[key];
     if (edgeType.includes("_")) return edgeType.toUpperCase();
@@ -562,6 +1032,30 @@ export class ProcessWriter {
       x: (b.x ?? 0) + Math.floor(w / 2),
       y: (b.y ?? 0) + Math.floor(h / 2),
     };
+  }
+
+  private isProcessObjectType(objectType?: string): boolean {
+    const t = (objectType ?? "").toLowerCase().replace(/[\s_-]/g, "");
+    return t === "process" || t === "processmodel";
+  }
+
+  private isActivityObjectType(objectType?: string): boolean {
+    const t = (objectType ?? "").toLowerCase().replace(/[\s_-]/g, "");
+    return t === "activity";
+  }
+
+  /** FLOW spine types that must use left-in / right-out (never top/bottom). */
+  private isFlowLeftRightType(objectType?: string): boolean {
+    return (
+      this.isProcessObjectType(objectType) ||
+      this.isActivityObjectType(objectType)
+    );
+  }
+
+  private isFlowEdgeType(edgeType?: string): boolean {
+    if (!edgeType) return false;
+    const key = edgeType.trim().toLowerCase().replace(/[_\s-]/g, "");
+    return key === "flow" || key === "sequence";
   }
 
   /**
@@ -592,42 +1086,83 @@ export class ProcessWriter {
   }
 
   /**
-   * Orthogonal polyline with endpoints on symbol borders (not centers).
-   * Stacked symbols (above/below) always use top↔bottom on the activity's
-   * horizontal center — even when the satellite is horizontally offset.
+   * FLOW incoming attach on left. Process chevrons inset into body;
+   * activities use the left AABB edge (no inset).
    */
-  private orthogonalPoints(
-    from: { x?: number; y?: number; width?: number; height?: number },
-    to: { x?: number; y?: number; width?: number; height?: number },
+  private flowLeftAttach(
+    box: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      objectType?: string;
+    },
+  ): { x: number; y: number; side: "left" } {
+    const x = box.x ?? 0;
+    const y = box.y ?? 0;
+    const w = box.width ?? DEFAULT_WIDTH;
+    const h = box.height ?? DEFAULT_HEIGHT;
+    const inset = this.isProcessObjectType(box.objectType)
+      ? Math.floor(w * PROCESS_EDGE_INSET)
+      : 0;
+    return {
+      x: x + inset,
+      y: y + Math.floor(h / 2),
+      side: "left",
+    };
+  }
+
+  /** FLOW outgoing attach on right edge (no inset — matches MT). */
+  private flowRightAttach(box: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+  }): { x: number; y: number; side: "right" } {
+    const x = box.x ?? 0;
+    const y = box.y ?? 0;
+    const w = box.width ?? DEFAULT_WIDTH;
+    const h = box.height ?? DEFAULT_HEIGHT;
+    return {
+      x: x + w,
+      y: y + Math.floor(h / 2),
+      side: "right",
+    };
+  }
+
+  /**
+   * Orthogonal route that respects process left-in / right-out, with detours
+   * when the peer is above/below (side loops) instead of attaching to top/bottom.
+   */
+  private routeOrthogonal(
+    p0: { x: number; y: number; side: "top" | "bottom" | "left" | "right" },
+    pN: { x: number; y: number; side: "top" | "bottom" | "left" | "right" },
+    opts?: { approachFromLeftOf?: number; departRightOf?: number },
   ): Array<{ x: number; y: number }> {
-    const fx = from.x ?? 0;
-    const fy = from.y ?? 0;
-    const fw = from.width ?? DEFAULT_WIDTH;
-    const fh = from.height ?? DEFAULT_HEIGHT;
-    const tx = to.x ?? 0;
-    const ty = to.y ?? 0;
-    const tw = to.width ?? DEFAULT_WIDTH;
-    const th = to.height ?? DEFAULT_HEIGHT;
-    const fromCenter = this.boxCenter(from);
-    const toCenter = this.boxCenter(to);
+    // Process left-in / right-out detours first — do not collapse to a straight
+    // chord that would cross the chevron body when peer is left/above/below.
+    if (pN.side === "left" && opts?.approachFromLeftOf !== undefined) {
+      const clearX = opts.approachFromLeftOf - PROCESS_ROUTE_STUB;
+      const pts: Array<{ x: number; y: number }> = [{ x: p0.x, y: p0.y }];
+      if (p0.x !== clearX) {
+        pts.push({ x: clearX, y: p0.y });
+      }
+      if (p0.y !== pN.y) {
+        pts.push({ x: clearX, y: pN.y });
+      }
+      pts.push({ x: pN.x, y: pN.y });
+      return pts;
+    }
 
-    const fromBelow = fy >= ty + th - 2;
-    const fromAbove = fy + fh <= ty + 2;
-
-    let p0: { x: number; y: number; side: "top" | "bottom" | "left" | "right" };
-    let pN: { x: number; y: number; side: "top" | "bottom" | "left" | "right" };
-
-    if (fromBelow) {
-      // Satellite below → activity: leave satellite top, enter activity bottom (center)
-      p0 = { x: fromCenter.x, y: fy, side: "top" };
-      pN = { x: toCenter.x, y: ty + th, side: "bottom" };
-    } else if (fromAbove) {
-      // Satellite above → activity: leave satellite bottom, enter activity top (center)
-      p0 = { x: fromCenter.x, y: fy + fh, side: "bottom" };
-      pN = { x: toCenter.x, y: ty, side: "top" };
-    } else {
-      p0 = this.borderAttachment(from, toCenter);
-      pN = this.borderAttachment(to, fromCenter);
+    // Leaving a process right when target is not further right on the same row
+    if (p0.side === "right" && opts?.departRightOf !== undefined) {
+      const stubX = opts.departRightOf + PROCESS_ROUTE_STUB;
+      return [
+        { x: p0.x, y: p0.y },
+        { x: stubX, y: p0.y },
+        { x: stubX, y: pN.y },
+        { x: pN.x, y: pN.y },
+      ];
     }
 
     if (p0.x === pN.x || p0.y === pN.y) {
@@ -653,6 +1188,120 @@ export class ProcessWriter {
       { x: pN.x, y: midY },
       { x: pN.x, y: pN.y },
     ];
+  }
+
+  /**
+   * FLOW involving process/activity: leave on the RIGHT and enter on the LEFT
+   * (never top/bottom on those types). Other symbols keep normal border
+   * attachment. Edge `points` are an orthogonal polyline.
+   */
+  private orthogonalPointsFlowLeftRight(
+    from: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      objectType?: string;
+    },
+    to: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      objectType?: string;
+    },
+  ): Array<{ x: number; y: number }> {
+    const fromForced = this.isFlowLeftRightType(from.objectType);
+    const toForced = this.isFlowLeftRightType(to.objectType);
+    // When either end is process/activity, both use left-in / right-out so
+    // BO↔activity and side branches stay off top/bottom of the activity.
+    const forceBoth = fromForced || toForced;
+    const fromCenter = this.boxCenter(from);
+    const toCenter = this.boxCenter(to);
+
+    const p0 = forceBoth
+      ? this.flowRightAttach(from)
+      : this.borderAttachment(from, toCenter);
+    const pN = forceBoth
+      ? this.flowLeftAttach(to)
+      : this.borderAttachment(to, fromCenter);
+
+    const opts: { approachFromLeftOf?: number; departRightOf?: number } = {};
+    const sameRow = Math.abs(p0.y - pN.y) <= 8;
+    if (forceBoth) {
+      const targetLeft = to.x ?? 0;
+      if (!sameRow || p0.x >= targetLeft - 2) {
+        opts.approachFromLeftOf = targetLeft;
+      }
+      const sourceRight = (from.x ?? 0) + (from.width ?? DEFAULT_WIDTH);
+      if (!sameRow || pN.x <= sourceRight + 2) {
+        opts.departRightOf = sourceRight;
+      }
+    }
+
+    return this.routeOrthogonal(p0, pN, opts);
+  }
+
+  /**
+   * Orthogonal polyline with endpoints on symbol borders (not centers).
+   * FLOW on process/activity: left-in / right-out (never top/bottom).
+   * Non-FLOW (RACI/CONTROLS/IS_USED_BY): stacked symbols use top↔bottom.
+   */
+  private orthogonalPoints(
+    from: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      objectType?: string;
+    },
+    to: {
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      objectType?: string;
+    },
+    edgeType?: string,
+  ): Array<{ x: number; y: number }> {
+    const isFlow = !edgeType || this.isFlowEdgeType(edgeType);
+    if (
+      isFlow &&
+      (this.isFlowLeftRightType(from.objectType) ||
+        this.isFlowLeftRightType(to.objectType))
+    ) {
+      return this.orthogonalPointsFlowLeftRight(from, to);
+    }
+
+    const fx = from.x ?? 0;
+    const fy = from.y ?? 0;
+    const fw = from.width ?? DEFAULT_WIDTH;
+    const fh = from.height ?? DEFAULT_HEIGHT;
+    const tx = to.x ?? 0;
+    const ty = to.y ?? 0;
+    const tw = to.width ?? DEFAULT_WIDTH;
+    const th = to.height ?? DEFAULT_HEIGHT;
+    const fromCenter = this.boxCenter(from);
+    const toCenter = this.boxCenter(to);
+
+    const fromBelow = fy >= ty + th - 2;
+    const fromAbove = fy + fh <= ty + 2;
+
+    let p0: { x: number; y: number; side: "top" | "bottom" | "left" | "right" };
+    let pN: { x: number; y: number; side: "top" | "bottom" | "left" | "right" };
+
+    if (fromBelow) {
+      p0 = { x: fromCenter.x, y: fy, side: "top" };
+      pN = { x: toCenter.x, y: ty + th, side: "bottom" };
+    } else if (fromAbove) {
+      p0 = { x: fromCenter.x, y: fy + fh, side: "bottom" };
+      pN = { x: toCenter.x, y: ty, side: "top" };
+    } else {
+      p0 = this.borderAttachment(from, toCenter);
+      pN = this.borderAttachment(to, fromCenter);
+    }
+
+    return this.routeOrthogonal(p0, pN);
   }
 
   /**
@@ -774,6 +1423,8 @@ export class ProcessWriter {
     toVertexId: string;
     edgeType: string;
     languageId: string;
+    /** Edge label text (e.g. Ja/Nej on gateway branches). */
+    label?: string;
   }) {
     const edgeType = this.toApiEdgeType(args.edgeType);
     const canvas = (await this.client.request({
@@ -789,13 +1440,16 @@ export class ProcessWriter {
         y?: number;
         width?: number;
         height?: number;
+        objectType?: string;
       }>;
     };
     const from = (canvas.vertices ?? []).find((v) => v.uuid === args.fromVertexId);
     const to = (canvas.vertices ?? []).find((v) => v.uuid === args.toVertexId);
-    const points = this.orthogonalPoints(from ?? {}, to ?? {});
+    const points = this.orthogonalPoints(from ?? {}, to ?? {}, edgeType);
     const midX = Math.floor(((points[0]?.x ?? 0) + (points[points.length - 1]?.x ?? 0)) / 2);
     const midY = Math.floor(((points[0]?.y ?? 0) + (points[points.length - 1]?.y ?? 0)) / 2) - 10;
+    const labelText = (args.label ?? "").trim();
+    const labelWidth = Math.max(40, Math.min(120, Math.ceil(labelText.length * 6) + 12));
 
     const edge = await this.client.request({
       method: "POST",
@@ -811,11 +1465,11 @@ export class ProcessWriter {
         points,
         labels: {
           [args.languageId]: {
-            title: "",
-            rawTitle: "",
-            x: midX,
+            title: labelText,
+            rawTitle: labelText,
+            x: midX - Math.floor(labelWidth / 2),
             y: midY,
-            width: 40,
+            width: labelWidth,
             height: 20,
           },
         },
@@ -824,7 +1478,12 @@ export class ProcessWriter {
     return {
       data: edge,
       methodologyNotes: [
-        `Created canvas edge type=${edgeType}. Common types: FLOW, RACI_RESPONSIBLE, CONTROLS, IS_USED_BY.`,
+        `Created canvas edge type=${edgeType}${labelText ? ` label="${labelText}"` : ""}. Common types: FLOW, RACI_RESPONSIBLE, CONTROLS, IS_USED_BY, IS_FOLLOWED_BY.`,
+        ...(this.isFlowEdgeType(edgeType)
+          ? [
+              "FLOW on process/activity: enter left edge, leave right edge (never top/bottom).",
+            ]
+          : []),
       ],
       nextSuggestedTools: ["get_process_flow", "describe_process"],
     };
@@ -912,12 +1571,14 @@ export class ProcessWriter {
       return exact.uuid;
     }
 
+    const alt = alternativeSymbolFor(args.objectType);
     const symbol = (await this.client.request({
       method: "POST",
       path: "/api/v1/repositories/{repositoryId}/symbols",
       pathParams: { repositoryId: args.repositoryId },
       body: {
         objectType: apiType,
+        ...(alt ? { alternativeSymbol: alt } : {}),
         titles: {
           [args.languageId]: {
             title: plainTitle,
@@ -934,6 +1595,94 @@ export class ProcessWriter {
     }
     args.cache.set(cacheKey, symbol.uuid);
     return symbol.uuid;
+  }
+
+  private boxesOverlap(
+    a: { x: number; y: number; width: number; height: number },
+    b: { x: number; y: number; width: number; height: number },
+    pad = 6,
+  ): boolean {
+    return !(
+      a.x + a.width + pad <= b.x ||
+      b.x + b.width + pad <= a.x ||
+      a.y + a.height + pad <= b.y ||
+      b.y + b.height + pad <= a.y
+    );
+  }
+
+  /**
+   * Nudge right, then down, until the box does not overlap occupied placements.
+   * Never leave two symbols on the exact same coordinates.
+   */
+  private findFreePlacement(
+    occupied: Array<{ x: number; y: number; width: number; height: number }>,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    stepX = 24,
+    stepY = 24,
+  ): { x: number; y: number; shifted: boolean } {
+    const collides = (cx: number, cy: number) =>
+      occupied.some((o) =>
+        this.boxesOverlap({ x: cx, y: cy, width, height }, o),
+      );
+    let cx = Math.round(x);
+    let cy = Math.round(y);
+    if (!collides(cx, cy)) {
+      return { x: cx, y: cy, shifted: false };
+    }
+    for (let i = 1; i <= 100; i++) {
+      const rightX = Math.round(x) + i * stepX;
+      if (!collides(rightX, Math.round(y))) {
+        return { x: rightX, y: Math.round(y), shifted: true };
+      }
+      const downY = Math.round(y) + i * stepY;
+      if (!collides(Math.round(x), downY)) {
+        return { x: Math.round(x), y: downY, shifted: true };
+      }
+      if (!collides(rightX, downY)) {
+        return { x: rightX, y: downY, shifted: true };
+      }
+    }
+    return {
+      x: Math.round(x) + 100 * stepX,
+      y: Math.round(y) + stepY,
+      shifted: true,
+    };
+  }
+
+  /**
+   * FLOW spine placement: only nudge horizontally so BO and process stay on
+   * the same vertical midline (never shift Y independently).
+   */
+  private findFreePlacementOnSpine(
+    occupied: Array<{ x: number; y: number; width: number; height: number }>,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    stepX = 24,
+  ): { x: number; y: number; shifted: boolean } {
+    const collides = (cx: number) =>
+      occupied.some((o) =>
+        this.boxesOverlap(
+          { x: cx, y: Math.round(y), width, height },
+          o,
+        ),
+      );
+    const cy = Math.round(y);
+    let cx = Math.round(x);
+    if (!collides(cx)) {
+      return { x: cx, y: cy, shifted: false };
+    }
+    for (let i = 1; i <= 200; i++) {
+      const rightX = Math.round(x) + i * stepX;
+      if (!collides(rightX)) {
+        return { x: rightX, y: cy, shifted: true };
+      }
+    }
+    return { x: Math.round(x) + 200 * stepX, y: cy, shifted: true };
   }
 
   private async placeVertex(args: {
@@ -953,9 +1702,54 @@ export class ProcessWriter {
      */
     edgeAttachSide?: "top" | "bottom" | "left" | "right";
     outsideLabelSide?: OutsideLabelSide;
+    /**
+     * In-batch boxes not yet on the canvas. Mutated when a free slot is taken.
+     */
+    reserved?: Array<{ x: number; y: number; width: number; height: number }>;
+    /** Skip overlap nudge (rare; default false). */
+    allowOverlap?: boolean;
+    /** Keep Y fixed (FLOW spine); only nudge X on collision. */
+    spineAlign?: boolean;
   }): Promise<{ uuid?: string; x?: number; y?: number; width?: number; height?: number }> {
     const width = args.width ?? DEFAULT_WIDTH;
     const height = args.height ?? DEFAULT_HEIGHT;
+
+    let x = Math.round(args.x);
+    let y = Math.round(args.y);
+    if (!args.allowOverlap) {
+      const canvas = (await this.client.request({
+        path: "/api/v1/repositories/{repositoryId}/models/{modelId}/canvas",
+        pathParams: {
+          repositoryId: args.repositoryId,
+          modelId: args.modelId,
+        },
+      })) as {
+        vertices?: Array<{
+          x?: number;
+          y?: number;
+          width?: number;
+          height?: number;
+        }>;
+      };
+      const occupied = [
+        ...(canvas.vertices ?? []).map((v) => ({
+          x: v.x ?? 0,
+          y: v.y ?? 0,
+          width: v.width ?? DEFAULT_WIDTH,
+          height: v.height ?? DEFAULT_HEIGHT,
+        })),
+        ...(args.reserved ?? []),
+      ];
+      const free = args.spineAlign
+        ? this.findFreePlacementOnSpine(occupied, x, y, width, height)
+        : this.findFreePlacement(occupied, x, y, width, height);
+      x = free.x;
+      y = free.y;
+      args.reserved?.push({ x, y, width, height });
+    } else {
+      args.reserved?.push({ x, y, width, height });
+    }
+
     const outsideLabelSide =
       args.outsideLabelSide ??
       (args.edgeAttachSide
@@ -964,8 +1758,8 @@ export class ProcessWriter {
     const { centerLabel, label } = this.labelBounds({
       objectType: args.objectType,
       title: args.title,
-      x: args.x,
-      y: args.y,
+      x,
+      y,
       width,
       height,
       outsideLabelSide,
@@ -978,8 +1772,8 @@ export class ProcessWriter {
         modelId: args.modelId,
       },
       body: {
-        x: args.x,
-        y: args.y,
+        x,
+        y,
         width,
         height,
         symbol: args.symbolId,
@@ -1005,6 +1799,12 @@ export class ProcessWriter {
     let modelId = args.modelId;
     const results: unknown[] = [];
     const symbolCache = new Map<string, string>();
+    const reserved: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }> = [];
     const placed: Array<{
       title: string;
       objectType: string;
@@ -1037,9 +1837,21 @@ export class ProcessWriter {
 
     const chain = proposal.chain ?? [];
     const activityDetails = proposal.activities ?? [];
+    const branches = proposal.branches ?? [];
     const detailByTitle = new Map(
       activityDetails.map((a) => [a.title.toLowerCase(), a]),
     );
+    const branchLabel = (
+      fromTitle: string,
+      toTitle: string,
+    ): string | undefined => {
+      const hit = branches.find(
+        (b) =>
+          b.fromTitle.toLowerCase() === fromTitle.toLowerCase() &&
+          b.toTitle.toLowerCase() === toTitle.toLowerCase(),
+      );
+      return hit?.label?.trim() || undefined;
+    };
     const repoConfig = await this.getRepoConfig(args.repositoryId);
     const { distance } = this.layoutGaps(repoConfig);
 
@@ -1066,6 +1878,7 @@ export class ProcessWriter {
       y: 20,
       width: processSize.width,
       height: processSize.height,
+      reserved,
     });
     placed.push({
       title: processTitle,
@@ -1078,17 +1891,29 @@ export class ProcessWriter {
 
     // FLOW spine — advance by symbol width + quickdraw left margin
     let previousVertexId: string | undefined;
+    let previousTitle: string | undefined;
+    let previousKind: string | undefined;
     let cursorX = 50;
     const activityVertices = new Map<
       string,
       { vertexId: string; x: number; y: number; width: number; height: number }
     >();
+    const vertexByTitle = new Map<
+      string,
+      { vertexId: string; x: number; y: number; width: number; height: number; kind: string }
+    >();
+    const connectedPairs = new Set<string>();
+
+    const spineY = (kind: string): number => {
+      if (kind === "businessObject") return Y_BO;
+      if (kind === "gateway" || kind === "and") return Y_GATEWAY;
+      return Y_ACTIVITY;
+    };
 
     for (const node of chain) {
-      const isBo = node.kind === "businessObject";
       const size = this.sizeFor(repoConfig, node.objectType);
       const x = cursorX;
-      const y = isBo ? Y_BO : Y_ACTIVITY;
+      const y = spineY(node.kind);
       const symbolId = await this.resolveOrCreateSymbol({
         repositoryId: args.repositoryId,
         languageId: args.languageId,
@@ -1109,8 +1934,11 @@ export class ProcessWriter {
         y,
         width: size.width,
         height: size.height,
+        reserved,
       });
       const vertexId = String(vertex.uuid);
+      const usedX = vertex.x ?? x;
+      const usedY = vertex.y ?? y;
       placed.push({
         title: node.title,
         objectType: node.objectType,
@@ -1118,8 +1946,20 @@ export class ProcessWriter {
         vertexId,
         kind: node.kind,
       });
+      vertexByTitle.set(node.title.toLowerCase(), {
+        vertexId,
+        x: usedX,
+        y: usedY,
+        width: size.width,
+        height: size.height,
+        kind: node.kind,
+      });
 
-      if (previousVertexId) {
+      if (previousVertexId && previousTitle) {
+        const label =
+          previousKind === "gateway" || previousKind === "and"
+            ? branchLabel(previousTitle, node.title)
+            : undefined;
         const edge = await this.createCanvasEdge({
           repositoryId: args.repositoryId,
           modelId,
@@ -1127,20 +1967,122 @@ export class ProcessWriter {
           toVertexId: vertexId,
           edgeType: "flow",
           languageId: args.languageId,
+          label,
         });
+        connectedPairs.add(
+          `${previousTitle.toLowerCase()}→${node.title.toLowerCase()}`,
+        );
         results.push({ flow: edge });
       }
       previousVertexId = vertexId;
-      if (!isBo) {
+      previousTitle = node.title;
+      previousKind = node.kind;
+      if (node.kind === "activity") {
         activityVertices.set(node.title.toLowerCase(), {
           vertexId,
-          x,
-          y,
+          x: usedX,
+          y: usedY,
           width: size.width,
           height: size.height,
         });
       }
-      cursorX += size.width + distance.left;
+      cursorX = usedX + size.width + distance.left;
+    }
+
+    // Side branches from gateways (targets not already adjacent on the spine)
+    let branchSlot = 0;
+    for (const b of branches) {
+      const pairKey = `${b.fromTitle.toLowerCase()}→${b.toTitle.toLowerCase()}`;
+      if (connectedPairs.has(pairKey)) {
+        continue;
+      }
+      const from = vertexByTitle.get(b.fromTitle.toLowerCase());
+      if (!from) {
+        results.push({
+          branchSkipped: `fromTitle not placed: ${b.fromTitle}`,
+        });
+        continue;
+      }
+
+      let to = vertexByTitle.get(b.toTitle.toLowerCase());
+      if (!to) {
+        const toKind = b.toKind ?? "activity";
+        const toOt =
+          b.objectType ??
+          (toKind === "businessObject"
+            ? "businessObject"
+            : toKind === "gateway"
+              ? "or"
+              : toKind === "and"
+                ? "and"
+                : "activity");
+        const size = this.sizeFor(repoConfig, toOt);
+        const x = from.x + Math.floor((from.width - size.width) / 2);
+        const y = from.y + BRANCH_Y_OFFSET + branchSlot * (size.height + distance.bottom);
+        branchSlot += 1;
+        const symbolId = await this.resolveOrCreateSymbol({
+          repositoryId: args.repositoryId,
+          languageId: args.languageId,
+          title: b.toTitle,
+          objectType: toOt,
+          owner: args.owner,
+          group: args.group,
+          cache: symbolCache,
+        });
+        const vertex = await this.placeVertex({
+          repositoryId: args.repositoryId,
+          modelId,
+          symbolId,
+          languageId: args.languageId,
+          title: b.toTitle,
+          objectType: toOt,
+          x,
+          y,
+          width: size.width,
+          height: size.height,
+          reserved,
+        });
+        const vertexId = String(vertex.uuid);
+        const usedX = vertex.x ?? x;
+        const usedY = vertex.y ?? y;
+        placed.push({
+          title: b.toTitle,
+          objectType: toOt,
+          symbolId,
+          vertexId,
+          kind: toKind,
+        });
+        to = {
+          vertexId,
+          x: usedX,
+          y: usedY,
+          width: size.width,
+          height: size.height,
+          kind: toKind,
+        };
+        vertexByTitle.set(b.toTitle.toLowerCase(), to);
+        if (toKind === "activity") {
+          activityVertices.set(b.toTitle.toLowerCase(), {
+            vertexId,
+            x: usedX,
+            y: usedY,
+            width: size.width,
+            height: size.height,
+          });
+        }
+      }
+
+      const edge = await this.createCanvasEdge({
+        repositoryId: args.repositoryId,
+        modelId,
+        fromVertexId: from.vertexId,
+        toVertexId: to.vertexId,
+        edgeType: "flow",
+        languageId: args.languageId,
+        label: b.label,
+      });
+      connectedPairs.add(pairKey);
+      results.push({ branchFlow: edge });
     }
 
     // RACI / CONTROLS / IS_USED_BY — pack per side so icons do not stack
@@ -1235,6 +2177,7 @@ export class ProcessWriter {
           width: sat.width,
           height: sat.height,
           edgeAttachSide,
+          reserved,
         });
         await this.createCanvasEdge({
           repositoryId: args.repositoryId,
@@ -1310,10 +2253,18 @@ export class ProcessWriter {
         placed,
         chainLength: chain.length,
         activityCount: activityDetails.length,
+        branchCount: branches.length,
       },
       methodologyNotes: [
         ...(proposal.methodologyNotes ?? []),
         "Applied FLOW chain, RACI_RESPONSIBLE, CONTROLS and IS_USED_BY with reuse-first symbols.",
+        "FLOW on activities/processes: left-in / right-out. Roles: one placement under each responsible activity (shared symbol, never fan-out edges).",
+        "Vertices are auto-nudged so symbols never stack on the same coordinates.",
+        ...(branches.length
+          ? [
+              "Applied gateway branches with FLOW edge labels (Ja/Nej). Side targets not on the spine are placed below the gateway.",
+            ]
+          : []),
       ],
       namingChecks: proposal.namingChecks,
       nextSuggestedTools: ["describe_process", "get_process_flow"],
@@ -1343,36 +2294,81 @@ export class ProcessWriter {
         symbol?: string | { uuid?: string };
         x?: number;
         y?: number;
+        width?: number;
+        height?: number;
+      }>;
+      edges?: Array<{
+        fromVertex?: string | { uuid?: string };
+        toVertex?: string | { uuid?: string };
+        edgeType?: string;
       }>;
     };
 
-    let performerVertex = (canvas.vertices ?? []).find((v) => {
+    const vertexId = (ref: string | { uuid?: string } | undefined): string =>
+      typeof ref === "string" ? ref : String(ref?.uuid ?? "");
+
+    // Reuse a role vertex only if it is already RACI-linked to THIS activity.
+    // Never fan out one placement to multiple activities — place a copy below each.
+    const alreadyLinked = (canvas.edges ?? []).find((e) => {
+      const et = (e.edgeType ?? "").toLowerCase().replace(/[_\s-]/g, "");
+      if (et !== "raciresponsible" && et !== "responsible") return false;
+      if (vertexId(e.toVertex) !== args.activityVertexId) return false;
+      const from = (canvas.vertices ?? []).find(
+        (v) => v.uuid === vertexId(e.fromVertex),
+      );
       const sid =
-        typeof v.symbol === "string" ? v.symbol : v.symbol?.uuid;
+        typeof from?.symbol === "string" ? from.symbol : from?.symbol?.uuid;
       return sid === args.performerSymbolId;
     });
 
-    if (!performerVertex) {
-      const activity = (canvas.vertices ?? []).find(
-        (v) => v.uuid === args.activityVertexId,
-      );
-      const repoConfig = await this.getRepoConfig(args.repositoryId);
-      const roleSize = this.sizeFor(repoConfig, "role");
-      performerVertex = await this.placeVertex({
-        repositoryId: args.repositoryId,
-        modelId: args.modelId,
-        symbolId: args.performerSymbolId,
-        languageId: args.languageId,
-        title: args.performerTitle ?? "Performer",
-        objectType: "role",
-        x: args.x ?? (activity?.x ?? 80),
-        y: args.y ?? (activity?.y ?? Y_BASE) + 160,
-        width: roleSize.width,
-        height: roleSize.height,
-        // Role sits below activity → edge attaches on top → label below
-        edgeAttachSide: "top",
-      });
+    let performerVertex = alreadyLinked
+      ? (canvas.vertices ?? []).find(
+          (v) => v.uuid === vertexId(alreadyLinked.fromVertex),
+        )
+      : undefined;
+
+    if (performerVertex && alreadyLinked) {
+      return {
+        data: {
+          performerVertex,
+          edge: alreadyLinked,
+          alreadyLinked: true,
+        },
+        methodologyNotes: [
+          "Performer already RACI-linked to this activity; no new edge created.",
+          "Same role on multiple activities: place a vertex under each activity (shared symbol UUID, separate canvas placements).",
+        ],
+        nextSuggestedTools: ["get_roles_and_responsibilities", "describe_process"],
+      };
     }
+
+    const activity = (canvas.vertices ?? []).find(
+      (v) => v.uuid === args.activityVertexId,
+    );
+    const repoConfig = await this.getRepoConfig(args.repositoryId);
+    const roleSize = this.sizeFor(repoConfig, "role");
+    const { distance } = this.layoutGaps(repoConfig);
+    const gap = Math.max(distance.bottom, 12);
+    const actX = activity?.x ?? 80;
+    const actY = activity?.y ?? Y_BASE;
+    const actW = activity?.width ?? DEFAULT_WIDTH;
+    const actH = activity?.height ?? DEFAULT_HEIGHT;
+    performerVertex = await this.placeVertex({
+      repositoryId: args.repositoryId,
+      modelId: args.modelId,
+      symbolId: args.performerSymbolId,
+      languageId: args.languageId,
+      title: args.performerTitle ?? "Performer",
+      objectType: "role",
+      x:
+        args.x ??
+        Math.round(actX + Math.floor(actW / 2) - Math.floor(roleSize.width / 2)),
+      y: args.y ?? Math.round(actY + actH + gap),
+      width: roleSize.width,
+      height: roleSize.height,
+      // Role sits below activity → edge attaches on top → label below
+      edgeAttachSide: "top",
+    });
 
     const edge = await this.createCanvasEdge({
       repositoryId: args.repositoryId,
@@ -1387,6 +2383,7 @@ export class ProcessWriter {
       data: { performerVertex, edge: edge.data },
       methodologyNotes: [
         "Linked performer via RACI_RESPONSIBLE. Placement alone is not ownership.",
+        "Same role on multiple activities: place a vertex under each activity (shared symbol UUID, separate canvas placements). Never one role icon with edges to many activities.",
       ],
       nextSuggestedTools: ["get_roles_and_responsibilities", "describe_process"],
     };

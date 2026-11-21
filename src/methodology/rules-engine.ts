@@ -58,6 +58,130 @@ export function checkNaming(
   }
 }
 
+const BO_VALUE_HINT =
+  "Name the value, artefact or capability produced (value stream) — not a status echo of the activity (avoid 'Godkänd X' after 'Godkänna X', 'Dokumenterad Y' after 'Dokumentera Y').";
+
+/** Strip soft hyphens / ¬ for comparison. */
+function plainTitle(title: string): string {
+  return title.replace(/[\u00AC\u00AD]/g, "").trim();
+}
+
+/**
+ * Detect BO titles that are past-participle restatements of the previous
+ * activity (status stickers) rather than value/artefact names.
+ */
+export function isBusinessObjectStatusEcho(
+  boTitle: string,
+  previousActivityTitle: string,
+): boolean {
+  const bo = plainTitle(boTitle).toLowerCase();
+  const act = plainTitle(previousActivityTitle).toLowerCase();
+  if (!bo || !act) return false;
+
+  const pairs: Array<{ act: RegExp; bo: RegExp }> = [
+    { act: /\bgodkänn/i, bo: /^godkänd\b/i },
+    { act: /\bdokumenter/i, bo: /^dokumenterad\b/i },
+    { act: /\brevider|revision/i, bo: /^reviderad\b/i },
+    { act: /\bgenomför/i, bo: /^genomförd\b/i },
+    { act: /\bregistrer/i, bo: /^registrerad\b/i },
+    { act: /\bplanera\b/i, bo: /^planerad\b/i },
+    { act: /\bbestäm/i, bo: /^bestämd\b/i },
+    { act: /\bskap/i, bo: /^skapad\b/i },
+    { act: /\buför/i, bo: /^utförd\b/i },
+  ];
+
+  const statusBo =
+    /^(dokumenterad|godkänd|reviderad|genomförd|utförd|avklarad|beslutad|planerad|registrerad|skapad)\b/i.test(
+      bo,
+    );
+  if (!statusBo) {
+    return false;
+  }
+
+  const pairHit = pairs.some((p) => p.act.test(act) && p.bo.test(bo));
+
+  const stop = new Set([
+    "och",
+    "för",
+    "av",
+    "att",
+    "en",
+    "ett",
+    "den",
+    "det",
+    "i",
+    "på",
+    "med",
+    "via",
+  ]);
+  const tokens = (s: string) =>
+    s
+      .split(/[^a-zåäöé0-9]+/i)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.length >= 3 && !stop.has(t));
+
+  const actToks = tokens(
+    act.replace(
+      /^(genomföra|dokumentera|godkänna|revidera|planera|bestämma|registrera|utföra)\s+/i,
+      "",
+    ),
+  );
+  const boToks = tokens(
+    bo.replace(
+      /^(dokumenterad|godkänd|reviderad|genomförd|utförd|avklarad|beslutad|planerad)\s+/i,
+      "",
+    ),
+  );
+  if (actToks.length === 0 || boToks.length === 0) {
+    return pairHit;
+  }
+  const overlap = boToks.filter((t) =>
+    actToks.some(
+      (a) =>
+        a.includes(t) ||
+        t.includes(a) ||
+        a.startsWith(t.slice(0, Math.min(4, t.length))) ||
+        t.startsWith(a.slice(0, Math.min(4, a.length))),
+    ),
+  );
+  return pairHit || overlap.length > 0;
+}
+
+/**
+ * Naming check for FLOW business objects: value/artefact vs status echo.
+ */
+export function checkBusinessObjectValue(
+  pack: MethodologyPack,
+  boTitle: string,
+  previousActivityTitle?: string,
+): NamingCheck {
+  const base = checkNaming(pack, "businessObject", boTitle);
+  if (
+    previousActivityTitle &&
+    isBusinessObjectStatusEcho(boTitle, previousActivityTitle)
+  ) {
+    return {
+      pass: false,
+      hint: BO_VALUE_HINT,
+      objectTypeId: "businessObject",
+    };
+  }
+  // Standalone weak anti-pattern: bare "Dokumenterad/Genomförd …" without artefact clarity
+  if (
+    /^(dokumenterad|genomförd|utförd|avklarad)\s+\S+/i.test(plainTitle(boTitle))
+  ) {
+    return {
+      pass: false,
+      hint: BO_VALUE_HINT,
+      objectTypeId: "businessObject",
+    };
+  }
+  return {
+    ...base,
+    hint: base.hint ?? BO_VALUE_HINT,
+  };
+}
+
 export function methodologyNotesForObject(
   pack: MethodologyPack,
   objectType: string,
@@ -117,6 +241,11 @@ const FALLBACK_SYMBOL_SIZES: Record<string, SymbolSizeSpec> = {
   application: { width: 20, height: 25 },
   coredocument: { width: 18, height: 18 },
   document: { width: 18, height: 18 },
+  or: { width: 30, height: 30 },
+  eller: { width: 30, height: 30 },
+  decision: { width: 30, height: 30 },
+  and: { width: 30, height: 30 },
+  gateway: { width: 30, height: 30 },
 };
 
 function objectTypeKey(objectType: string): string {
@@ -302,10 +431,21 @@ export function validateProposedSymbol(
     objectType: string;
     title: string;
     repoConfig?: unknown | null;
+    /** Preceding activity title — used to detect BO status echoes. */
+    previousActivityTitle?: string;
   },
 ): ValidationResult {
   const notes = methodologyNotesForObject(pack, args.objectType);
-  const namingCheck = checkNaming(pack, args.objectType, args.title);
+  const isBo =
+    normalize(args.objectType) === "businessobject" ||
+    findObjectType(pack, args.objectType)?.id === "businessObject";
+  const namingCheck = isBo
+    ? checkBusinessObjectValue(
+        pack,
+        args.title,
+        args.previousActivityTitle,
+      )
+    : checkNaming(pack, args.objectType, args.title);
   const configViolations: string[] = [];
 
   if (args.repoConfig) {
@@ -345,15 +485,54 @@ export function getMethodologyTopic(
   topic: string,
 ): unknown {
   const t = normalize(topic);
+  // Fold accents so vägval / vagval both resolve
+  const tFold = t.normalize("NFD").replace(/\p{M}/gu, "");
 
   if (t === "sources") {
     return pack.sources;
   }
 
+  // Vägval / "gateway" jargon → Regel (Eller) = or
+  const exclusiveAliases = new Set([
+    "vagval",
+    "vägval",
+    "gateway",
+    "gateways",
+    "decision",
+    "regel",
+    "eller",
+    "beslut",
+    "xor",
+    "or",
+  ]);
+  if (exclusiveAliases.has(t) || exclusiveAliases.has(tFold)) {
+    const object = pack.objectTypes.find((ot) => ot.id === "or");
+    const rule = pack.rules.gateways;
+    if (rule || object) {
+      return {
+        ...(rule && typeof rule === "object" ? (rule as object) : {}),
+        kind: "vägval",
+        id: "vägval",
+        createObjectType: "or",
+        methodologyNameSv: "Regel (Eller)",
+        searchObjectTypes: ["or", "vägval", "decision"],
+        neverUse: ["gateway", "join", "förbinda"],
+        agentNote:
+          'There is no "gateway" create type in 2c8. Call resolve_branching_object_type — useObjectType is "or".',
+        objectType: object,
+      };
+    }
+  }
+
   const object = pack.objectTypes.find(
     (ot) =>
       normalize(ot.id) === t ||
-      (ot.apiObjectTypeHints ?? []).some((h) => normalize(h) === t),
+      normalize(ot.id).normalize("NFD").replace(/\p{M}/gu, "") === tFold ||
+      (ot.apiObjectTypeHints ?? []).some(
+        (h) =>
+          normalize(h) === t ||
+          normalize(h).normalize("NFD").replace(/\p{M}/gu, "") === tFold,
+      ),
   );
   const model = pack.modelTypes.find(
     (mt) =>
