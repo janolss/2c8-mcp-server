@@ -17,6 +17,44 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
   const writer = ctx.writer;
 
   server.registerTool(
+    "create_repository",
+    {
+      description:
+        "Create a new 2c8 repository (POST /repositories). Use for sandboxes such as 'Utveckling MCP'.",
+      inputSchema: {
+        name: z.string().min(1),
+        languages: z
+          .array(
+            z.object({
+              name: z.string(),
+              locale: z.string(),
+              default: z.boolean().optional(),
+            }),
+          )
+          .optional()
+          .describe("Defaults to Svenska sv_SE"),
+        template: z.boolean().optional(),
+        owner: uuid.optional(),
+        directory: uuid.optional(),
+        colorScheme: uuid.optional(),
+        body: jsonBody.optional(),
+      },
+    },
+    async (args) =>
+      runTool(() =>
+        writer.createRepository({
+          name: args.name,
+          languages: args.languages,
+          template: args.template,
+          owner: args.owner,
+          directory: args.directory,
+          colorScheme: args.colorScheme,
+          body: args.body,
+        }),
+      ),
+  );
+
+  server.registerTool(
     "create_process_model",
     {
       description:
@@ -42,6 +80,32 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
           body: args.body,
         }),
       ),
+  );
+
+  server.registerTool(
+    "create_canvas_edge",
+    {
+      description:
+        "Create a canvas edge (orthogonal points). edgeType: FLOW, RACI_RESPONSIBLE, CONTROLS, IS_USED_BY, IS_FOLLOWED_BY. FLOW on process/activity: left-in / right-out. For RACI: never fan one role vertex to multiple activities — place a role under each activity (prefer set_activity_performer). Optional label for VÄGVAL answers (Ja/Nej).",
+      inputSchema: {
+        repositoryId,
+        modelId: uuid,
+        fromVertexId: uuid,
+        toVertexId: uuid,
+        languageId,
+        edgeType: z
+          .string()
+          .min(1)
+          .describe(
+            "e.g. flow, raciresponsible, controls, isusedby, isfollowedby",
+          ),
+        label: z
+          .string()
+          .optional()
+          .describe("Edge label text, e.g. Ja / Nej on vägval branches"),
+      },
+    },
+    async (args) => runTool(() => writer.createCanvasEdge(args)),
   );
 
   server.registerTool(
@@ -84,7 +148,9 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
         objectType: z
           .string()
           .optional()
-          .describe("Defaults to activity; e.g. businessObject, role"),
+          .describe(
+            'Defaults to activity; e.g. businessObject, role, or (vägval/Regel Eller). Call resolve_branching_object_type for branching. NEVER gateway or join.',
+          ),
         symbolId: uuid.optional().describe("Reuse this symbol UUID if known"),
         connectFromVertexId: uuid
           .optional()
@@ -107,11 +173,17 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "reuse_symbol",
     {
       description:
-        "Place an existing symbol UUID on a model canvas (reuse, not duplicate).",
+        "Place an existing symbol UUID on a model canvas (reuse, not duplicate). Uses repository symbolsizes + label placement (inside for activity/process, below for small icons).",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         symbolId: uuid,
+        languageId,
+        title: z.string().optional().describe("For label bounds sizing"),
+        objectType: z
+          .string()
+          .optional()
+          .describe("Defaults to activity; drives symbolsizes lookup"),
         x: z.number().optional(),
         y: z.number().optional(),
       },
@@ -123,13 +195,18 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "set_activity_performer",
     {
       description:
-        "Link a role/position/organisation symbol as performer of an activity vertex.",
+        "Link a role/position/organisation as performer of one activity (RACI_RESPONSIBLE). Always places a vertex under that activity (reuses symbol UUID). Never attaches one canvas role to multiple activities — call once per activity.",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         activityVertexId: uuid,
         performerSymbolId: uuid,
-        edgeType: z.string().optional(),
+        languageId,
+        performerTitle: z.string().optional(),
+        edgeType: z
+          .string()
+          .optional()
+          .describe("Defaults to raciresponsible"),
         x: z.number().optional(),
         y: z.number().optional(),
       },
@@ -141,12 +218,13 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "set_step_io",
     {
       description:
-        "Connect two vertices with a flow edge to express input/output between steps.",
+        "Connect two vertices with a FLOW edge to express input/output between steps.",
       inputSchema: {
         repositoryId,
         modelId: uuid,
         fromVertexId: uuid,
         toVertexId: uuid,
+        languageId,
         edgeType: z.string().optional(),
       },
     },
@@ -173,14 +251,90 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext): void {
     "create_breakdown",
     {
       description:
-        "Create a breakdown (nedbrytning) linking this model as detail of a symbol/edge. Body matches MtbBreakdownWriteDto.",
+        "Create a breakdown (nedbrytning) on the DETAIL model. Preferred body: { symbol: \"<overviewSymbolUuid>\" }. Do not use ofSymbol/ofModel/ofVertex or nested {uuid,version}. Prefer link_breakdown for the common case.",
       inputSchema: {
         repositoryId,
         modelId: uuid.describe("Target detail model UUID"),
-        body: jsonBody,
+        body: jsonBody.describe(
+          'Write DTO, typically { "symbol": "<processSymbolUuidOnOverview>" }',
+        ),
       },
     },
     async (args) => runTool(() => writer.createBreakdown(args)),
+  );
+
+  server.registerTool(
+    "link_breakdown",
+    {
+      description:
+        "Link a detail process model as breakdown of an overview process symbol. POSTs { symbol: overviewSymbolId } on the detail model. Prefer this over raw create_breakdown.",
+      inputSchema: {
+        repositoryId,
+        detailModelId: uuid.describe("Detail model that elaborates the process"),
+        overviewSymbolId: uuid.describe(
+          "Process symbol UUID placed on the overview map (same UUID as reused on canvas)",
+        ),
+      },
+    },
+    async (args) => runTool(() => writer.linkBreakdown(args)),
+  );
+
+  server.registerTool(
+    "create_process_map",
+    {
+      description:
+        "Create a process map / overview. PREFERRED: pass detailModelIds (ordered detail UUIDs) — server derives BO↔process chain from each detail's inputs/outputs (same symbols). Do NOT invent overview BOs. Optional chain is locked to detail scopes when detailModelId is set. Validates scope; blocks mismatches. Never stacks vertices.",
+      inputSchema: {
+        repositoryId,
+        languageId,
+        title: z.string().min(1),
+        detailModelIds: z
+          .array(uuid)
+          .min(1)
+          .optional()
+          .describe(
+            "PREFERRED. Ordered detail model UUIDs left→right. Builds chain from get_detail_process_scope — overview I/O = detail I/O.",
+          ),
+        chain: z
+          .array(
+            z.object({
+              kind: z.enum(["businessObject", "process"]),
+              title: z.string().min(1),
+              symbolId: uuid.optional(),
+              detailModelId: uuid
+                .optional()
+                .describe("When kind=process: link breakdown to this detail model"),
+            }),
+          )
+          .optional()
+          .describe("Only if detailModelIds omitted; BOs will be rewritten from detail scopes when detailModelId is set"),
+        lockBosToDetailScope: z
+          .boolean()
+          .optional()
+          .describe("Default true when chain has detailModelId — replace BOs with detail inputs/outputs"),
+        sideLoops: z
+          .array(
+            z.object({
+              fromBoTitle: z
+                .string()
+                .min(1)
+                .describe("Business object title on the main chain"),
+              processTitle: z.string().min(1),
+              symbolId: uuid.optional(),
+              detailModelId: uuid.optional(),
+              placement: z.enum(["below"]).optional(),
+            }),
+          )
+          .optional(),
+        permissionGroup: permissionGroupHeader,
+        owner: uuid.optional(),
+        group: uuid.optional(),
+        modelId: uuid
+          .optional()
+          .describe("Append to existing model; otherwise creates new"),
+      },
+    },
+    async (args) => runTool(() => writer.createProcessMap(args)),
   );
 
   server.registerTool(

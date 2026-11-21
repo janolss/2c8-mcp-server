@@ -100,6 +100,8 @@ export interface FlowStep {
   title?: string;
   x?: number;
   y?: number;
+  width?: number;
+  height?: number;
   hasDocument?: boolean;
   documents?: Array<{ id: string; title?: string }>;
   inputs?: FlowStepRef[];
